@@ -60,8 +60,15 @@ import com.guhit.studio.engine.BrushPresets
 import com.guhit.studio.engine.CanvasSurfaceView
 import com.guhit.studio.engine.FingerMode
 import java.util.Locale
+import kotlin.math.roundToInt
 
 private enum class Panel { None, Brushes, Color, Actions }
+
+/** 1% steps; the top of the slider snaps to exactly 100% so the stroke is fully opaque. */
+private fun snapOpacity(v: Float): Float {
+    val r = (v * 100f).roundToInt() / 100f
+    return if (r >= 0.97f) 1f else r.coerceAtLeast(0.01f)
+}
 
 @Composable
 fun CanvasScreen() {
@@ -264,7 +271,7 @@ fun CanvasScreen() {
                                     String.format(Locale.US, "%.0f%%", opacity * 100f),
                                     style = MaterialTheme.typography.labelSmall,
                                 )
-                                VerticalSlider(value = opacity, onValueChange = { opacity = it })
+                                VerticalSlider(value = opacity, onValueChange = { opacity = snapOpacity(it) })
                                 Text(stringResource(R.string.label_opacity), style = MaterialTheme.typography.labelSmall)
                             }
                         }
