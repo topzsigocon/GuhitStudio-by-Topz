@@ -1,0 +1,2 @@
+-keepclasseswithmembernames class * { native <methods>; }
+-keep class com.guhit.studio.engine.NativeEngine { *; }
