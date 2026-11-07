@@ -307,7 +307,12 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
     private fun beginStroke() {
         if (pending.isEmpty()) return
         mode = Mode.DRAWING
-        val b = brush.copy(erase = brush.erase || strokeErase)
+        // Finger pressure is only a simulation (speed), so it may thin the line but must never
+        // fade the paint: flow stays constant for finger strokes.
+        val b = brush.copy(
+            erase = brush.erase || strokeErase,
+            flowPressure = if (strokeIsFinger) 0f else brush.flowPressure,
+        )
         strokeBrush = b
         val first = pending[0]
         fx = first.x
