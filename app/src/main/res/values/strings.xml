@@ -2,4 +2,18 @@
 <resources>
     <string name="app_name">Guhit Studio</string>
     <string name="reset_view">I-reset ang view</string>
+    <string name="tool_eraser">Burador</string>
+    <string name="menu_more">⋯</string>
+    <string name="label_size">Laki</string>
+    <string name="label_opacity">Opacity</string>
+    <string name="undo">↶</string>
+    <string name="redo">↷</string>
+    <string name="export_png">I-export bilang PNG (transparent)</string>
+    <string name="export_png_white">I-export bilang PNG (puting background)</string>
+    <string name="export_jpeg">I-export bilang JPEG</string>
+    <string name="finger_draws">Gumuguhit ang daliri</string>
+    <string name="finger_draws_hint">Patay: stylus ang gumuguhit, daliri ay para sa galaw</string>
+    <string name="export_saved">Na-save ang larawan</string>
+    <string name="export_failed">Hindi na-save ang larawan</string>
+    <string name="stylus_detected">May stylus na nakita. Ang daliri ay para na sa galaw lang.</string>
 </resources>
