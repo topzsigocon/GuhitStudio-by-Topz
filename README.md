@@ -2,7 +2,7 @@
 
 Native Android digital painting app. 100% offline, no ads, no accounts. (Working name.)
 
-**Status:** M0 - foundation. See the master prompt for the full roadmap (M0-M11).
+**Status:** M1a - drawing (v0.2.0). See the master prompt for the full roadmap (M0-M11).
 
 ## Build (GitHub)
 1. Push this repo to GitHub (branch `main`).
@@ -24,8 +24,12 @@ git tag v0.1.0 && git push origin v0.1.0
 Create a keystore once: `keytool -genkeypair -v -keystore release.jks -alias guhit -keyalg RSA -keysize 4096 -validity 10000`
 then `base64 -w0 release.jks` for the secret. Never commit the keystore.
 
-## Try M0
-Two fingers: pan, pinch-zoom, rotate. Top panel collapses with the handle. One-finger drawing arrives in M1.
+## Try it
+- One finger (or stylus): draw. Two fingers: pan / pinch-zoom / rotate.
+- Two-finger tap: undo. Three-finger tap: redo.
+- Top bar: brush list, eraser, color, menu (export, finger mode, reset view). Handles collapse the panels.
+- Menu -> Export saves a PNG/JPEG through the system file picker.
+- Autosave and gallery arrive in M1b: export your work before closing the app.
 
 ## License
 To be decided by the owner (add a LICENSE file).
