@@ -1,6 +1,13 @@
 # Changelog
 Format: Keep a Changelog, SemVer.
 
+## [0.2.1]
+### Changed
+- App renamed to "GuhitStudio by Topz" (personal use).
+### Fixed
+- Opacity slider: top of the slider now snaps to exactly 100% (1% steps), so strokes can be fully opaque.
+- Finger strokes no longer fade the paint with simulated pressure (only the line width changes).
+
 ## [0.2.0] - M1a: Drawing
 ### Added
 - Real drawing with finger or stylus (GPU brush stamping, stroke buffer, opacity cap).

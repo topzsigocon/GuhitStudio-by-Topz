@@ -1,4 +1,4 @@
-# Guhit Studio
+# GuhitStudio by Topz
 
 Native Android digital painting app. 100% offline, no ads, no accounts. (Working name.)
 
@@ -32,4 +32,4 @@ then `base64 -w0 release.jks` for the secret. Never commit the keystore.
 - Autosave and gallery arrive in M1b: export your work before closing the app.
 
 ## License
-To be decided by the owner (add a LICENSE file).
+Personal use only. See LICENSE.
