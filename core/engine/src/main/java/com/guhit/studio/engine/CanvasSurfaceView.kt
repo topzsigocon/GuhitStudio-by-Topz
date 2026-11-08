@@ -24,6 +24,7 @@ enum class FingerMode { DRAW, NAVIGATE }
  *  - Finger (or stylus) draws with the current [brush]; finger pressure is simulated from speed.
  *  - Two fingers: pan / pinch-zoom / rotate. Two-finger tap = undo, three-finger tap = redo.
  *  - When a stylus is first seen, fingers switch to navigation (palm friendly).
+ *  - Call [openDocument] to set the canvas size and (optionally) load saved pixels.
  */
 class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
 
@@ -37,6 +38,32 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
     var autoSwitchOnStylus = true
     var onHistoryChanged: ((undo: Int, redo: Int) -> Unit)? = null
     var onStylusDetected: (() -> Unit)? = null
+
+    /** Fired (UI thread) after a stroke is committed or after undo/redo: the artwork changed. */
+    var onContentChanged: (() -> Unit)? = null
+
+    /** The GPU canvas could not be created (size not supported by this device). */
+    var onCanvasError: (() -> Unit)? = null
+
+    /** The GL context was lost and recreated: the app must reload the artwork from disk. */
+    var onContextRecreated: (() -> Unit)? = null
+
+    // ---- document state ----
+    private class DocState(val w: Int, val h: Int, val pixels: ByteArray?)
+
+    private val lock = Any()
+    private var pendingDoc: DocState? = null
+    private var glReady = false
+    private var everReady = false
+
+    @Volatile
+    private var contentValid = false
+
+    @Volatile
+    private var canvasW = 2048
+
+    @Volatile
+    private var canvasH = 2048
 
     // ---- view transform (screen = t + scale * R(rotation) * canvasPoint, origin = canvas center) ----
     private class Transform(val tx: Float, val ty: Float, val scale: Float, val rotation: Float)
@@ -90,7 +117,19 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
         setRenderer(object : Renderer {
             override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
                 NativeEngine.nativeInit()
-                reportHistory()
+                var recreated = false
+                synchronized(lock) {
+                    recreated = everReady
+                    everReady = true
+                    glReady = true
+                }
+                if (recreated) {
+                    // Pixels in GPU memory are gone. Block drawing/saving until the app reloads them.
+                    contentValid = false
+                    NativeEngine.nativeNewCanvas(canvasW, canvasH)
+                    ui.post { onContextRecreated?.invoke() }
+                }
+                applyPendingDoc()
             }
 
             override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) =
@@ -106,27 +145,47 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
 
     // ---------------------------------------------------------------- public API
 
+    /** Creates the canvas (w x h) and optionally loads premultiplied RGBA pixels into it. */
+    fun openDocument(w: Int, h: Int, pixels: ByteArray?) {
+        canvasW = w
+        canvasH = h
+        if (width > 0 && height > 0) resetView() else hasTransform = false
+        synchronized(lock) {
+            pendingDoc = DocState(w, h, pixels)
+            if (glReady) queueEvent { applyPendingDoc() }
+        }
+        requestRender()
+    }
+
     fun resetView() {
         if (width == 0 || height == 0) return
-        val fit = min(width, height) / CANVAS_SIZE * 0.9f
+        hasTransform = true
+        val fit = min(width / canvasW.toFloat(), height / canvasH.toFloat()) * 0.9f
         setTransform(width / 2f, height / 2f, fit, 0f)
     }
 
     fun undo() = gl {
-        NativeEngine.nativeUndo()
-        reportHistory()
+        val changed = NativeEngine.nativeUndo()
+        reportHistory(changed)
     }
 
     fun redo() = gl {
-        NativeEngine.nativeRedo()
-        reportHistory()
+        val changed = NativeEngine.nativeRedo()
+        reportHistory(changed)
     }
 
-    /** Premultiplied RGBA, canvas-top-first, CANVAS_SIZE^2 * 4 bytes. Callback runs on the UI thread. */
+    /**
+     * Premultiplied RGBA, canvas-top-first, width*height*4 bytes. Callback runs on the UI thread
+     * with null if the content is not valid (e.g. while reloading after a GL context loss).
+     */
     fun exportPixels(onDone: (ByteArray?) -> Unit) = gl {
-        val buf = ByteArray(NativeEngine.CANVAS_SIZE * NativeEngine.CANVAS_SIZE * 4)
-        val ok = NativeEngine.nativeReadPixels(buf)
-        ui.post { onDone(if (ok) buf else null) }
+        if (!contentValid) {
+            ui.post { onDone(null) }
+        } else {
+            val buf = ByteArray(canvasW * canvasH * 4)
+            val ok = NativeEngine.nativeReadPixels(buf)
+            ui.post { onDone(if (ok) buf else null) }
+        }
     }
 
     // ---------------------------------------------------------------- helpers
@@ -136,10 +195,28 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
         requestRender()
     }
 
-    private fun reportHistory() {
+    /** GL thread: apply a queued document (new canvas + optional pixels). */
+    private fun applyPendingDoc() {
+        val d = synchronized(lock) {
+            val x = pendingDoc
+            pendingDoc = null
+            x
+        } ?: return
+        val ok = NativeEngine.nativeNewCanvas(d.w, d.h) &&
+            (d.pixels == null || NativeEngine.nativeLoadPixels(d.pixels))
+        contentValid = ok
+        if (!ok) ui.post { onCanvasError?.invoke() }
+        reportHistory(false)
+    }
+
+    /** GL thread. */
+    private fun reportHistory(changed: Boolean) {
         val u = NativeEngine.nativeUndoCount()
         val r = NativeEngine.nativeRedoCount()
-        ui.post { onHistoryChanged?.invoke(u, r) }
+        ui.post {
+            onHistoryChanged?.invoke(u, r)
+            if (changed) onContentChanged?.invoke()
+        }
     }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
@@ -155,15 +232,15 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
         requestRender()
     }
 
-    /** Screen px -> canvas px (0..CANVAS_SIZE, y down). Result in outX/outY. */
+    /** Screen px -> canvas px (0..width, 0..height, y down). Result in outX/outY. */
     private fun toCanvas(sx: Float, sy: Float) {
         val t = transform
         val dx = (sx - t.tx) / t.scale
         val dy = (sy - t.ty) / t.scale
         val c = cos(t.rotation)
         val s = sin(t.rotation)
-        outX = c * dx + s * dy + CANVAS_SIZE / 2f
-        outY = -s * dx + c * dy + CANVAS_SIZE / 2f
+        outX = c * dx + s * dy + canvasW / 2f
+        outY = -s * dx + c * dy + canvasH / 2f
     }
 
     // ---------------------------------------------------------------- touch
@@ -188,6 +265,10 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
     }
 
     private fun onFirstDown(e: MotionEvent) {
+        if (!contentValid) {
+            mode = Mode.IDLE
+            return
+        }
         ui.removeCallbacks(flush)
         pending.clear()
         tracking = false
@@ -373,7 +454,7 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
         gl {
             NativeEngine.nativeStrokeAdd(cx, cy, pressure)
             NativeEngine.nativeStrokeEnd()
-            reportHistory()
+            reportHistory(true)
         }
     }
 
@@ -438,7 +519,6 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
     }
 
     private companion object {
-        const val CANVAS_SIZE = NativeEngine.CANVAS_SIZE.toFloat()
         const val MIN_SCALE = 0.05f
         const val MAX_SCALE = 64f
         const val ARBITRATION_MS = 40L
