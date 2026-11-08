@@ -1,0 +1,99 @@
+name: Unpack update
+
+# Upload a .zip (repo root or updates/) through the GitHub website. This workflow unpacks it into the
+# repo, deletes the zip, commits, and starts the CI build. No need to upload files one by one.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '*.zip'
+      - 'updates/*.zip'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: unpack
+  cancel-in-progress: false
+
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Unpack zip files
+        id: unpack
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          zips=(*.zip updates/*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "No zip files found. Nothing to do."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          names=""
+          for z in "${zips[@]}"; do
+            echo "::group::Unpacking $z"
+            unzip -tq "$z" > /dev/null || { echo "::error::$z is not a valid zip file"; exit 1; }
+            if unzip -Z1 "$z" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
+              echo "::error::$z contains unsafe paths"; exit 1
+            fi
+
+            tmp="$(mktemp -d)"
+            unzip -q "$z" -d "$tmp"
+
+            # If the zip wraps everything in one folder (e.g. GuhitStudio/), step inside it.
+            src="$tmp"
+            mapfile -t top < <(find "$tmp" -mindepth 1 -maxdepth 1)
+            if [ ${#top[@]} -eq 1 ] && [ -d "${top[0]}" ] && [ -f "${top[0]}/settings.gradle.kts" ]; then
+              src="${top[0]}"
+              echo "Stripping top-level folder: $(basename "${top[0]}")"
+            fi
+
+            if [ -d "$src/.github" ]; then
+              echo "::warning::.github/ inside $z was skipped. Workflow files must be edited on the website."
+            fi
+
+            rsync -a --exclude='.git/' --exclude='.github/' --exclude='*.zip' "$src"/ ./
+            git rm -q -f -- "$z"
+            rm -rf "$tmp"
+            names="$names $(basename "$z")"
+            echo "::endgroup::"
+          done
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "names=${names# }" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push
+        if: steps.unpack.outputs.changed == 'true'
+        env:
+          NAMES: ${{ steps.unpack.outputs.names }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "Unpack update: ${NAMES}"
+          git pull --rebase origin "$BRANCH"
+          git push origin "HEAD:$BRANCH"
+
+      # Pushes made with the built-in token do not start other workflows, so start CI explicitly.
+      - name: Start CI build
+        if: steps.unpack.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.ref_name }}
+        run: gh workflow run ci.yml --ref "$BRANCH"
