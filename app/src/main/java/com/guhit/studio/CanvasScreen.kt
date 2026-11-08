@@ -1,10 +1,12 @@
 package com.guhit.studio
 
+import android.content.Context
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -24,6 +26,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -31,6 +34,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -70,10 +74,120 @@ private fun snapOpacity(v: Float): Float {
     return if (r >= 0.97f) 1f else r.coerceAtLeast(0.01f)
 }
 
+/** Loads the artwork's pixels from disk, then shows the editor. */
 @Composable
-fun CanvasScreen() {
+fun CanvasScreen(artwork: Artwork, onClose: () -> Unit) {
     val context = LocalContext.current
-    val canvas = remember { CanvasSurfaceView(context) }
+    var pixels by remember(artwork.id) { mutableStateOf<ByteArray?>(null) }
+    var ready by remember(artwork.id) { mutableStateOf(false) }
+
+    LaunchedEffect(artwork.id) {
+        Thread {
+            val px = ArtworkRepository.loadPixels(context, artwork)
+            Handler(Looper.getMainLooper()).post {
+                pixels = px
+                ready = true
+            }
+        }.start()
+    }
+    // Free the extra copy once the editor owns the pixels.
+    LaunchedEffect(ready) { if (ready) pixels = null }
+
+    if (!ready) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            CircularProgressIndicator()
+        }
+    } else {
+        EditorContent(artwork, pixels, onClose)
+    }
+}
+
+/** Debounced + on-demand autosave. Snapshots are taken on the GL thread, written off the UI thread. */
+private class Saver(
+    private val context: Context,
+    private val art: Artwork,
+    private val canvas: CanvasSurfaceView,
+) {
+    private val main = Handler(Looper.getMainLooper())
+    private var dirty = false
+    private var running = false
+    private var rerun = false
+    private val waiters = ArrayList<() -> Unit>()
+    private val debounce = Runnable { request {} }
+
+    fun markDirty() {
+        dirty = true
+        main.removeCallbacks(debounce)
+        main.postDelayed(debounce, AUTOSAVE_DELAY_MS)
+    }
+
+    fun cancelTimer() = main.removeCallbacks(debounce)
+
+    /** Saves if there are unsaved changes, then calls [onDone] (also when nothing needed saving). */
+    fun request(onDone: () -> Unit) {
+        waiters.add(onDone)
+        if (running) {
+            rerun = true
+            return
+        }
+        start()
+    }
+
+    private fun start() {
+        if (!dirty) {
+            finish()
+            return
+        }
+        running = true
+        dirty = false
+        canvas.exportPixels { px ->
+            if (px == null) {
+                dirty = true
+                running = false
+                finish()
+                return@exportPixels
+            }
+            Thread {
+                ArtworkRepository.save(context, art, px)
+                main.post {
+                    running = false
+                    if (rerun) {
+                        rerun = false
+                        start()
+                    } else {
+                        finish()
+                    }
+                }
+            }.start()
+        }
+    }
+
+    private fun finish() {
+        val w = ArrayList(waiters)
+        waiters.clear()
+        w.forEach { it() }
+    }
+
+    private companion object {
+        const val AUTOSAVE_DELAY_MS = 4000L
+    }
+}
+
+@Composable
+private fun EditorContent(artwork: Artwork, initialPixels: ByteArray?, onClose: () -> Unit) {
+    val context = LocalContext.current
+    val canvas = remember {
+        CanvasSurfaceView(context).also { it.openDocument(artwork.width, artwork.height, initialPixels) }
+    }
+    val saver = remember { Saver(context, artwork, canvas) }
+    var closing by remember { mutableStateOf(false) }
+
+    fun closeEditor() {
+        if (closing) return
+        closing = true
+        saver.cancelTimer()
+        saver.request { onClose() }
+    }
 
     var panel by remember { mutableStateOf(Panel.None) }
     var barVisible by remember { mutableStateOf(true) }
@@ -98,11 +212,14 @@ fun CanvasScreen() {
     }
 
     // GL lifecycle + callbacks from the engine.
-    DisposableEffect(canvas) {
+    DisposableEffect(canvas, saver) {
         val lifecycle = (context as ComponentActivity).lifecycle
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
-                Lifecycle.Event.ON_PAUSE -> canvas.onPause()
+                Lifecycle.Event.ON_PAUSE -> {
+                    saver.request {}   // queue the snapshot before the GL thread pauses
+                    canvas.onPause()
+                }
                 Lifecycle.Event.ON_RESUME -> canvas.onResume()
                 else -> Unit
             }
@@ -116,10 +233,28 @@ fun CanvasScreen() {
             fingerDraws = false
             Toast.makeText(context, R.string.stylus_detected, Toast.LENGTH_LONG).show()
         }
+        canvas.onContentChanged = { saver.markDirty() }
+        canvas.onCanvasError = {
+            Toast.makeText(context, R.string.canvas_error, Toast.LENGTH_LONG).show()
+            onClose()
+        }
+        canvas.onContextRecreated = {
+            // GPU memory was lost: reload the last saved version.
+            Thread {
+                val px = ArtworkRepository.loadPixels(context, artwork)
+                Handler(Looper.getMainLooper()).post {
+                    canvas.openDocument(artwork.width, artwork.height, px)
+                }
+            }.start()
+        }
         onDispose {
             lifecycle.removeObserver(observer)
+            saver.cancelTimer()
             canvas.onHistoryChanged = null
             canvas.onStylusDetected = null
+            canvas.onContentChanged = null
+            canvas.onCanvasError = null
+            canvas.onContextRecreated = null
         }
     }
 
@@ -132,7 +267,7 @@ fun CanvasScreen() {
                 return@exportPixels
             }
             Thread {
-                val ok = ExportHelper.save(context, uri, pixels, format)
+                val ok = ExportHelper.save(context, uri, pixels, artwork.width, artwork.height, format)
                 Handler(Looper.getMainLooper()).post {
                     Toast.makeText(
                         context,
@@ -159,6 +294,10 @@ fun CanvasScreen() {
         panel = if (panel == p) Panel.None else p
     }
 
+    BackHandler(enabled = !closing) {
+        if (panel != Panel.None) panel = Panel.None else closeEditor()
+    }
+
     Box(Modifier.fillMaxSize()) {
         AndroidView(factory = { canvas }, modifier = Modifier.fillMaxSize())
 
@@ -178,6 +317,7 @@ fun CanvasScreen() {
         ) {
             AnimatedVisibility(visible = barVisible) {
                 FloatingBar {
+                    TextButton(onClick = ::closeEditor) { Text(stringResource(R.string.gallery)) }
                     TextButton(onClick = { toggle(Panel.Brushes) }) { Text(preset.name) }
                     TextButton(
                         onClick = { erase = !erase },
@@ -296,6 +436,25 @@ fun CanvasScreen() {
                     modifier = Modifier.padding(horizontal = 3.dp, vertical = 18.dp),
                     style = MaterialTheme.typography.labelSmall,
                 )
+            }
+        }
+
+        if (closing) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(Color(0xAA000000))
+                    .pointerInput(Unit) {
+                        awaitPointerEventScope {
+                            while (true) awaitPointerEvent().changes.forEach { it.consume() }
+                        }
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    CircularProgressIndicator()
+                    Text(stringResource(R.string.saving))
+                }
             }
         }
     }

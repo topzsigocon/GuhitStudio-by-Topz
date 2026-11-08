@@ -17,7 +17,7 @@ class MainActivity : ComponentActivity() {
             hide(WindowInsetsCompat.Type.systemBars())
         }
         setContent {
-            GuhitTheme { CanvasScreen() }
+            GuhitTheme { AppRoot() }
         }
     }
 }
