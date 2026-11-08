@@ -16,4 +16,22 @@
     <string name="export_saved">Na-save ang larawan</string>
     <string name="export_failed">Hindi na-save ang larawan</string>
     <string name="stylus_detected">May stylus na nakita. Ang daliri ay para na sa galaw lang.</string>
+    <string name="gallery_subtitle">Lahat ng drawing mo ay naka-save sa device na ito. Offline.</string>
+    <string name="gallery_empty">Wala pang artwork. Pindutin ang “Bagong Canvas” para magsimula.</string>
+    <string name="new_canvas">Bagong Canvas</string>
+    <string name="canvas_name">Pangalan (opsyonal)</string>
+    <string name="width_px">Lapad (px)</string>
+    <string name="height_px">Taas (px)</string>
+    <string name="canvas_limits">Pinakamaliit 64 px; pinakamalaki 4096 px bawat gilid (hanggang 16.7 milyong pixel).</string>
+    <string name="create">Gawin</string>
+    <string name="cancel">Kanselahin</string>
+    <string name="ok">OK</string>
+    <string name="rename">Palitan ang pangalan</string>
+    <string name="duplicate">I-duplicate</string>
+    <string name="delete">Burahin</string>
+    <string name="delete_confirm">Buburahin ang “%1$s” nang tuluyan. Hindi na ito mababawi.</string>
+    <string name="gallery">Galeriya</string>
+    <string name="saving">Sine-save…</string>
+    <string name="opening">Binubuksan…</string>
+    <string name="canvas_error">Hindi kayang gawin ng device na ito ang ganitong kalaking canvas.</string>
 </resources>
