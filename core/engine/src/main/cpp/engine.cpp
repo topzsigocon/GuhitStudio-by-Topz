@@ -1,10 +1,10 @@
-// Guhit Studio engine - M1a: GPU canvas, brush stamping, stroke buffer, undo/redo, export.
+// Guhit Studio engine - M1b: variable-size GPU canvas, brush stamping, stroke buffer, undo/redo, load/export.
 //
 // Pipeline:
 //   stamps -> stroke buffer (premultiplied, opacity applied later)
 //   stroke end -> composite(layer[cur], stroke) -> layer[1-cur]  (ping-pong)
 //   undo/redo store before/after pixels of the stroke's bounding rect.
-// Texture row 0 == canvas TOP. Canvas pixel coords: (0,0) top-left, y down.
+// Texture row 0 == canvas TOP. Canvas pixel coords: (0,0) top-left, y down. Size set by nativeNewCanvas.
 #include <jni.h>
 #include <GLES3/gl3.h>
 #include <android/log.h>
@@ -20,7 +20,6 @@
 
 namespace {
 
-constexpr int kSize = 2048;
 constexpr size_t kMaxHistoryBytes = 256u * 1024u * 1024u;
 constexpr size_t kMaxHistoryEntries = 200;
 constexpr size_t kStampFlushCount = 4096;
@@ -32,13 +31,14 @@ uniform vec2 uView;
 uniform vec2 uT;
 uniform float uS;
 uniform float uR;
+uniform vec2 uCanvas;                   // canvas size in px
 out vec2 vUv;
 void main() {
     float c = cos(uR);
     float s = sin(uR);
     vec2 p = uT + uS * vec2(c * aPos.x - s * aPos.y, s * aPos.x + c * aPos.y);
     gl_Position = vec4(p.x / uView.x * 2.0 - 1.0, 1.0 - p.y / uView.y * 2.0, 0.0, 1.0);
-    vUv = aPos / 2048.0 + 0.5;
+    vUv = aPos / uCanvas + 0.5;
 }
 )";
 
@@ -74,6 +74,7 @@ void main() {
 
 const char* kStampVs = R"(#version 300 es
 layout(location = 0) in vec4 aStamp;   // x, y (canvas px), diameter px, alpha
+uniform vec2 uCanvas;
 out vec2 vLocal;
 out float vAlpha;
 out float vHalf;
@@ -83,7 +84,7 @@ void main() {
     vAlpha = aStamp.w;
     vHalf = aStamp.z * 0.5;
     vec2 p = aStamp.xy + c * vHalf;
-    gl_Position = vec4(p.x / 1024.0 - 1.0, p.y / 1024.0 - 1.0, 0.0, 1.0);
+    gl_Position = vec4(p.x / uCanvas.x * 2.0 - 1.0, p.y / uCanvas.y * 2.0 - 1.0, 0.0, 1.0);
 }
 )";
 
@@ -110,13 +111,15 @@ GLuint gQuadVao = 0, gQuadVbo = 0, gEmptyVao = 0, gStampVao = 0, gStampVbo = 0;
 GLuint gTex[2] = {0, 0}, gFbo[2] = {0, 0};
 GLuint gStrokeTex = 0, gStrokeFbo = 0;
 int gCur = 0;
-int gWidth = 1, gHeight = 1;
+int gWidth = 1, gHeight = 1;      // screen viewport
+int gCw = 0, gCh = 0;              // canvas size
+int gMaxTex = 2048;
 
 struct CompositeLocs { GLint layer, stroke, opacity, erase, paper, active; };
-struct DisplayLocs { GLint view, t, s, r; CompositeLocs c; };
+struct DisplayLocs { GLint view, t, s, r, canvas; CompositeLocs c; };
 DisplayLocs gDisp{};
 CompositeLocs gCommit{};
-GLint gStampColor = -1, gStampHardness = -1;
+GLint gStampColor = -1, gStampHardness = -1, gStampCanvas = -1;
 
 // ---------- brush / stroke ----------
 struct Brush {
@@ -188,7 +191,7 @@ CompositeLocs compositeLocs(GLuint p) {
 void makeTexture(GLuint& tex, GLuint& fbo) {
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
-    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, kSize, kSize);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, gCw, gCh);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -229,12 +232,13 @@ float sizeAt(float pressure) {
 void flushStamps() {
     if (gStampBuf.empty()) return;
     glBindFramebuffer(GL_FRAMEBUFFER, gStrokeFbo);
-    glViewport(0, 0, kSize, kSize);
+    glViewport(0, 0, gCw, gCh);
     glEnable(GL_BLEND);
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     glUseProgram(gStampProg);
     glUniform3f(gStampColor, gBrush.r, gBrush.g, gBrush.b);
     glUniform1f(gStampHardness, std::clamp(gBrush.hardness, 0.0f, 0.99f));
+    glUniform2f(gStampCanvas, static_cast<float>(gCw), static_cast<float>(gCh));
     glBindVertexArray(gStampVao);
     glBindBuffer(GL_ARRAY_BUFFER, gStampVbo);
     glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(gStampBuf.size() * sizeof(float)),
@@ -297,8 +301,8 @@ void commitStroke() {
     flushStamps();
     int x0 = std::max(0, static_cast<int>(std::floor(gMinX)));
     int y0 = std::max(0, static_cast<int>(std::floor(gMinY)));
-    int x1 = std::min(kSize, static_cast<int>(std::ceil(gMaxX)));
-    int y1 = std::min(kSize, static_cast<int>(std::ceil(gMaxY)));
+    int x1 = std::min(gCw, static_cast<int>(std::ceil(gMaxX)));
+    int y1 = std::min(gCh, static_cast<int>(std::ceil(gMaxY)));
     gStroke = false;
     if (x1 <= x0 || y1 <= y0) {
         clearStroke();
@@ -306,7 +310,7 @@ void commitStroke() {
     }
     int src = gCur, dst = 1 - gCur;
     glBindFramebuffer(GL_FRAMEBUFFER, gFbo[dst]);
-    glViewport(0, 0, kSize, kSize);
+    glViewport(0, 0, gCw, gCh);
     glDisable(GL_BLEND);
     glUseProgram(gCommitProg);
     glActiveTexture(GL_TEXTURE0);
@@ -338,7 +342,30 @@ void commitStroke() {
     clearStroke();
 }
 
+void releaseCanvas() {
+    for (int i = 0; i < 2; ++i) {
+        if (gFbo[i]) glDeleteFramebuffers(1, &gFbo[i]);
+        if (gTex[i]) glDeleteTextures(1, &gTex[i]);
+        gFbo[i] = 0;
+        gTex[i] = 0;
+    }
+    if (gStrokeFbo) glDeleteFramebuffers(1, &gStrokeFbo);
+    if (gStrokeTex) glDeleteTextures(1, &gStrokeTex);
+    gStrokeFbo = 0;
+    gStrokeTex = 0;
+    gCw = gCh = 0;
+    gUndo.clear();
+    gRedo.clear();
+    gHistBytes = 0;
+    gStampBuf.clear();
+    gStroke = false;
+    gCur = 0;
+}
+
 void destroyAll() {
+    gTex[0] = gTex[1] = gFbo[0] = gFbo[1] = 0;   // old context's objects are gone
+    gStrokeTex = gStrokeFbo = 0;
+    gCw = gCh = 0;
     gUndo.clear();
     gRedo.clear();
     gHistBytes = 0;
@@ -363,18 +390,19 @@ Java_com_guhit_studio_engine_NativeEngine_nativeInit(JNIEnv*, jobject) {
     gDisp.t = glGetUniformLocation(gDisplayProg, "uT");
     gDisp.s = glGetUniformLocation(gDisplayProg, "uS");
     gDisp.r = glGetUniformLocation(gDisplayProg, "uR");
+    gDisp.canvas = glGetUniformLocation(gDisplayProg, "uCanvas");
     gDisp.c = compositeLocs(gDisplayProg);
     gCommit = compositeLocs(gCommitProg);
     gStampColor = glGetUniformLocation(gStampProg, "uColor");
     gStampHardness = glGetUniformLocation(gStampProg, "uHardness");
+    gStampCanvas = glGetUniformLocation(gStampProg, "uCanvas");
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &gMaxTex);
 
-    const float h = kSize / 2.0f;
-    const float quad[8] = {-h, -h, h, -h, -h, h, h, h};
     glGenVertexArrays(1, &gQuadVao);
     glBindVertexArray(gQuadVao);
     glGenBuffers(1, &gQuadVbo);
     glBindBuffer(GL_ARRAY_BUFFER, gQuadVbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+    glBufferData(GL_ARRAY_BUFFER, 8 * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
     glBindVertexArray(0);
@@ -390,10 +418,48 @@ Java_com_guhit_studio_engine_NativeEngine_nativeInit(JNIEnv*, jobject) {
     glVertexAttribDivisor(0, 1);
     glBindVertexArray(0);
 
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+// Allocates a blank canvas of w x h (replaces any existing one). False if unsupported.
+JNIEXPORT jboolean JNICALL
+Java_com_guhit_studio_engine_NativeEngine_nativeNewCanvas(JNIEnv*, jobject, jint w, jint h) {
+    if (!gStampProg || w < 1 || h < 1 || w > gMaxTex || h > gMaxTex) return JNI_FALSE;
+    releaseCanvas();
+    gCw = w;
+    gCh = h;
+    while (glGetError() != GL_NO_ERROR) {}
     makeTexture(gTex[0], gFbo[0]);
     makeTexture(gTex[1], gFbo[1]);
     makeTexture(gStrokeTex, gStrokeFbo);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (glGetError() != GL_NO_ERROR) {
+        releaseCanvas();
+        return JNI_FALSE;
+    }
+    const float hw = w / 2.0f, hh = h / 2.0f;
+    const float quad[8] = {-hw, -hh, hw, -hh, -hw, hh, hw, hh};
+    glBindBuffer(GL_ARRAY_BUFFER, gQuadVbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_DYNAMIC_DRAW);
+    return JNI_TRUE;
+}
+
+// Replaces the current layer with premultiplied RGBA pixels (w*h*4 bytes, row 0 = top).
+JNIEXPORT jboolean JNICALL
+Java_com_guhit_studio_engine_NativeEngine_nativeLoadPixels(JNIEnv* env, jobject, jbyteArray in) {
+    if (!gTex[gCur] || gCw <= 0) return JNI_FALSE;
+    const size_t need = static_cast<size_t>(gCw) * gCh * 4;
+    if (static_cast<size_t>(env->GetArrayLength(in)) < need) return JNI_FALSE;
+    jbyte* p = env->GetByteArrayElements(in, nullptr);
+    if (!p) return JNI_FALSE;
+    glBindTexture(GL_TEXTURE_2D, gTex[gCur]);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, gCw, gCh, GL_RGBA, GL_UNSIGNED_BYTE, p);
+    env->ReleaseByteArrayElements(in, p, JNI_ABORT);
+    gUndo.clear();
+    gRedo.clear();
+    gHistBytes = 0;
+    return JNI_TRUE;
 }
 
 JNIEXPORT void JNICALL
@@ -413,6 +479,7 @@ Java_com_guhit_studio_engine_NativeEngine_nativeDraw(JNIEnv*, jobject, jfloat tx
     glClear(GL_COLOR_BUFFER_BIT);
     if (!gDisplayProg || !gTex[gCur]) return;
     glUseProgram(gDisplayProg);
+    glUniform2f(gDisp.canvas, static_cast<float>(gCw), static_cast<float>(gCh));
     glUniform2f(gDisp.view, static_cast<float>(gWidth), static_cast<float>(gHeight));
     glUniform2f(gDisp.t, tx, ty);
     glUniform1f(gDisp.s, scale);
@@ -454,7 +521,7 @@ Java_com_guhit_studio_engine_NativeEngine_nativeSetBrush(JNIEnv*, jobject, jfloa
 
 JNIEXPORT void JNICALL
 Java_com_guhit_studio_engine_NativeEngine_nativeStrokeBegin(JNIEnv*, jobject) {
-    if (!gStampProg) return;
+    if (!gStampProg || !gTex[0]) return;
     gStroke = true;
     gN = 0;
     gCarry = 0;
@@ -539,13 +606,14 @@ Java_com_guhit_studio_engine_NativeEngine_nativeRedoCount(JNIEnv*, jobject) {
     return static_cast<jint>(gRedo.size());
 }
 
-// Fills `out` (kSize*kSize*4 bytes) with premultiplied RGBA, row 0 = canvas top.
+// Fills `out` (w*h*4 bytes) with premultiplied RGBA, row 0 = canvas top.
 JNIEXPORT jboolean JNICALL
 Java_com_guhit_studio_engine_NativeEngine_nativeReadPixels(JNIEnv* env, jobject, jbyteArray out) {
-    const jsize need = kSize * kSize * 4;
-    if (!gFbo[gCur] || env->GetArrayLength(out) < need) return JNI_FALSE;
+    if (!gFbo[gCur] || gCw <= 0) return JNI_FALSE;
+    const jsize need = gCw * gCh * 4;
+    if (env->GetArrayLength(out) < need) return JNI_FALSE;
     std::vector<uint8_t> buf;
-    readRect(gFbo[gCur], 0, 0, kSize, kSize, buf);
+    readRect(gFbo[gCur], 0, 0, gCw, gCh, buf);
     env->SetByteArrayRegion(out, 0, need, reinterpret_cast<const jbyte*>(buf.data()));
     return JNI_TRUE;
 }
