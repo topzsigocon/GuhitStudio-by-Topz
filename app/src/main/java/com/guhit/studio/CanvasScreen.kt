@@ -205,10 +205,14 @@ private fun EditorContent(artwork: Artwork, initialPixels: ByteArray?, onClose: 
     val preset = BrushPresets.all.first { it.id == presetId }
     val sizePx = BrushMath.sizeFromSlider(sizeValue)
 
-    // Push UI state into the engine view.
+    // Read EVERY brush-related state here, in the screen's own scope, so any change (size, opacity,
+    // color, eraser, preset, finger mode) recomposes this function and re-runs the SideEffect.
+    // (Reading them only inside the panels would recompose just the panels and leave the engine stale.)
+    val brushSettings = preset.toSettings(sizePx, opacity, color.toArgb(), erase)
+    val fingerMode = if (fingerDraws) FingerMode.DRAW else FingerMode.NAVIGATE
     SideEffect {
-        canvas.brush = preset.toSettings(sizePx, opacity, color.toArgb(), erase)
-        canvas.fingerMode = if (fingerDraws) FingerMode.DRAW else FingerMode.NAVIGATE
+        canvas.brush = brushSettings
+        canvas.fingerMode = fingerMode
     }
 
     // GL lifecycle + callbacks from the engine.
