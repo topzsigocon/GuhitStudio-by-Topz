@@ -13,7 +13,7 @@ android {
         minSdk = 26
         targetSdk = 35
         versionCode = System.getenv("VERSION_CODE")?.toIntOrNull() ?: 1
-        versionName = System.getenv("VERSION_NAME") ?: "0.3.0"
+        versionName = System.getenv("VERSION_NAME") ?: "0.3.1"
     }
 
     val keystorePath: String? = System.getenv("KEYSTORE_PATH")
