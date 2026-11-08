@@ -1,6 +1,11 @@
 # Changelog
 Format: Keep a Changelog, SemVer.
 
+## [0.3.1]
+### Fixed
+- Opacity (and color, eraser, finger mode) changes were only sent to the engine after the size slider
+  moved. All brush state is now read in the screen scope so every change applies immediately.
+
 ## [0.3.0] - M1b: Gallery, autosave, new canvas
 ### Added
 - Gallery (home screen): thumbnails, open, rename, duplicate, delete (with confirmation).
