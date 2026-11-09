@@ -1,10 +1,16 @@
-// Guhit Studio engine - M1b: variable-size GPU canvas, brush stamping, stroke buffer, undo/redo, load/export.
+// Guhit Studio engine - M2: layers.
 //
-// Pipeline:
-//   stamps -> stroke buffer (premultiplied, opacity applied later)
-//   stroke end -> composite(layer[cur], stroke) -> layer[1-cur]  (ping-pong)
-//   undo/redo store before/after pixels of the stroke's bounding rect.
-// Texture row 0 == canvas TOP. Canvas pixel coords: (0,0) top-left, y down. Size set by nativeNewCanvas.
+//  layers[i] (RGBA8 premultiplied, one GPU texture each)  ->  recomposite(rect)  ->  flat texture
+//  recomposite walks the visible layers bottom->top through two scratch buffers (blend modes need
+//  the backdrop), restricted by scissor to a dirty rect, then blits that rect into `flat`.
+//  The screen only ever samples `flat` (+ white paper), so pan/zoom costs one texture read.
+//
+//  Strokes: stamps -> stroke buffer (opacity applied later). While drawing, the active layer's pass
+//  includes the stroke (live preview). On commit the stroke is blended INTO the layer in place with
+//  fixed-function blending (normal / erase / alpha lock). Undo stores before/after pixels of the
+//  stroke rect per layer.
+//
+// Texture row 0 == canvas TOP. Canvas pixel coords: (0,0) top-left, y down.
 #include <jni.h>
 #include <GLES3/gl3.h>
 #include <android/log.h>
@@ -13,6 +19,7 @@
 #include <cmath>
 #include <cstdint>
 #include <deque>
+#include <utility>
 #include <vector>
 
 #define LOG_TAG "GuhitEngine"
@@ -23,15 +30,17 @@ namespace {
 constexpr size_t kMaxHistoryBytes = 256u * 1024u * 1024u;
 constexpr size_t kMaxHistoryEntries = 200;
 constexpr size_t kStampFlushCount = 4096;
+constexpr size_t kTextureBudgetBytes = 512u * 1024u * 1024u;
+constexpr int kFixedTextures = 4;  // 2 scratch + flat + stroke
 
-// ---------- shaders ----------
+// ---------------------------------------------------------------- shaders
 const char* kDisplayVs = R"(#version 300 es
 layout(location = 0) in vec2 aPos;
 uniform vec2 uView;
 uniform vec2 uT;
 uniform float uS;
 uniform float uR;
-uniform vec2 uCanvas;                   // canvas size in px
+uniform vec2 uCanvas;
 out vec2 vUv;
 void main() {
     float c = cos(uR);
@@ -39,6 +48,17 @@ void main() {
     vec2 p = uT + uS * vec2(c * aPos.x - s * aPos.y, s * aPos.x + c * aPos.y);
     gl_Position = vec4(p.x / uView.x * 2.0 - 1.0, 1.0 - p.y / uView.y * 2.0, 0.0, 1.0);
     vUv = aPos / uCanvas + 0.5;
+}
+)";
+
+const char* kDisplayFs = R"(#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uFlat;
+out vec4 outColor;
+void main() {
+    vec4 c = texture(uFlat, vUv);
+    outColor = c + vec4(1.0) * (1.0 - c.a);   // premultiplied over white paper
 }
 )";
 
@@ -51,24 +71,105 @@ void main() {
 }
 )";
 
-const char* kCompositeFs = R"(#version 300 es
+const char* kStrokeFs = R"(#version 300 es
 precision highp float;
 in vec2 vUv;
-uniform sampler2D uLayer;
 uniform sampler2D uStroke;
 uniform float uOpacity;
-uniform float uErase;
-uniform float uPaper;
-uniform float uStrokeActive;
 out vec4 outColor;
 void main() {
+    outColor = texture(uStroke, vUv) * uOpacity;
+}
+)";
+
+const char* kLayerFs = R"(#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uBackdrop;
+uniform sampler2D uLayer;
+uniform sampler2D uStroke;
+uniform sampler2D uClip;
+uniform float uOpacity;
+uniform int uBlend;
+uniform int uUseClip;
+uniform int uStrokeOn;
+uniform float uStrokeOpacity;
+uniform int uStrokeErase;
+uniform int uStrokeLock;
+out vec4 outColor;
+
+float lum(vec3 c) { return dot(c, vec3(0.3, 0.59, 0.11)); }
+vec3 clipColor(vec3 c) {
+    float l = lum(c);
+    float n = min(min(c.r, c.g), c.b);
+    float x = max(max(c.r, c.g), c.b);
+    if (n < 0.0) c = l + (c - l) * l / (l - n);
+    if (x > 1.0) c = l + (c - l) * (1.0 - l) / (x - l);
+    return c;
+}
+vec3 setLum(vec3 c, float l) { return clipColor(c + (l - lum(c))); }
+float sat(vec3 c) { return max(max(c.r, c.g), c.b) - min(min(c.r, c.g), c.b); }
+vec3 setSat(vec3 c, float s) {
+    float mx = max(max(c.r, c.g), c.b);
+    float mn = min(min(c.r, c.g), c.b);
+    if (mx > mn) return (c - mn) * s / (mx - mn);
+    return vec3(0.0);
+}
+float burn(float b, float s) {
+    if (s <= 0.0) return b >= 1.0 ? 1.0 : 0.0;
+    return 1.0 - min(1.0, (1.0 - b) / s);
+}
+float dodge(float b, float s) {
+    if (b <= 0.0) return 0.0;
+    if (s >= 1.0) return 1.0;
+    return min(1.0, b / (1.0 - s));
+}
+vec3 hardLight(vec3 cb, vec3 cs) {
+    return mix(cb * 2.0 * cs, 1.0 - 2.0 * (1.0 - cb) * (1.0 - cs), step(0.5, cs));
+}
+vec3 softLight(vec3 cb, vec3 cs) {
+    vec3 d = mix(((16.0 * cb - 12.0) * cb + 4.0) * cb, sqrt(cb), step(0.25, cb));
+    return mix(cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb), cb + (2.0 * cs - 1.0) * (d - cb), step(0.5, cs));
+}
+vec3 blendRgb(vec3 cb, vec3 cs, int m) {
+    if (m == 1) return cb * cs;
+    if (m == 2) return min(cb, cs);
+    if (m == 3) return vec3(burn(cb.r, cs.r), burn(cb.g, cs.g), burn(cb.b, cs.b));
+    if (m == 4) return max(cb + cs - 1.0, 0.0);
+    if (m == 5) return cb + cs - cb * cs;
+    if (m == 6) return max(cb, cs);
+    if (m == 7) return vec3(dodge(cb.r, cs.r), dodge(cb.g, cs.g), dodge(cb.b, cs.b));
+    if (m == 8) return min(cb + cs, 1.0);
+    if (m == 9) return hardLight(cs, cb);
+    if (m == 10) return softLight(cb, cs);
+    if (m == 11) return hardLight(cb, cs);
+    if (m == 12) return abs(cb - cs);
+    if (m == 13) return cb + cs - 2.0 * cb * cs;
+    if (m == 14) return setLum(setSat(cs, sat(cb)), lum(cb));
+    if (m == 15) return setLum(setSat(cb, sat(cs)), lum(cb));
+    if (m == 16) return setLum(cs, lum(cb));
+    if (m == 17) return setLum(cb, lum(cs));
+    return cs;
+}
+
+void main() {
+    vec4 b = texture(uBackdrop, vUv);
     vec4 l = texture(uLayer, vUv);
-    vec4 s = texture(uStroke, vUv) * uOpacity * uStrokeActive;
-    vec4 res = (uErase > 0.5) ? l * (1.0 - s.a) : s + l * (1.0 - s.a);
-    if (uPaper > 0.5) {
-        res = res + vec4(1.0) * (1.0 - res.a);
+    if (uStrokeOn == 1) {
+        vec4 s = texture(uStroke, vUv) * uStrokeOpacity;
+        if (uStrokeErase == 1) l = l * (1.0 - s.a);
+        else if (uStrokeLock == 1) l = vec4(s.rgb * l.a + l.rgb * (1.0 - s.a), l.a);
+        else l = s + l * (1.0 - s.a);
     }
-    outColor = res;
+    vec4 src = l * uOpacity;
+    if (uUseClip == 1) src *= texture(uClip, vUv).a;
+    if (src.a <= 0.0001) { outColor = b; return; }
+    vec3 cs = src.rgb / src.a;
+    vec3 cb = b.a > 0.0001 ? b.rgb / b.a : vec3(0.0);
+    vec3 mixedRgb = (uBlend == 0) ? cs : blendRgb(cb, cs, uBlend);
+    vec3 rgb = src.a * (1.0 - b.a) * cs + src.a * b.a * mixedRgb + (1.0 - src.a) * b.rgb;
+    float a = src.a + b.a * (1.0 - src.a);
+    outColor = vec4(rgb, a);
 }
 )";
 
@@ -105,23 +206,41 @@ void main() {
 }
 )";
 
-// ---------- GL state ----------
-GLuint gDisplayProg = 0, gCommitProg = 0, gStampProg = 0;
-GLuint gQuadVao = 0, gQuadVbo = 0, gEmptyVao = 0, gStampVao = 0, gStampVbo = 0;
-GLuint gTex[2] = {0, 0}, gFbo[2] = {0, 0};
-GLuint gStrokeTex = 0, gStrokeFbo = 0;
-int gCur = 0;
-int gWidth = 1, gHeight = 1;      // screen viewport
-int gCw = 0, gCh = 0;              // canvas size
-int gMaxTex = 2048;
+// ---------------------------------------------------------------- state
+struct Rect { int x = 0, y = 0, w = 0, h = 0; };
 
-struct CompositeLocs { GLint layer, stroke, opacity, erase, paper, active; };
-struct DisplayLocs { GLint view, t, s, r, canvas; CompositeLocs c; };
-DisplayLocs gDisp{};
-CompositeLocs gCommit{};
+struct Layer {
+    int id = 0;
+    GLuint tex = 0, fbo = 0;
+    bool visible = true;
+    float opacity = 1.0f;
+    int blend = 0;
+    bool alphaLock = false;
+    bool clip = false;
+};
+
+struct LayerLocs {
+    GLint backdrop, layer, stroke, clip, opacity, blend, useClip, strokeOn, strokeOpacity, strokeErase, strokeLock;
+};
+
+GLuint gDisplayProg = 0, gLayerProg = 0, gStrokeProg = 0, gStampProg = 0;
+GLuint gQuadVao = 0, gQuadVbo = 0, gEmptyVao = 0, gStampVao = 0, gStampVbo = 0;
+GLint uView = -1, uT = -1, uS = -1, uR = -1, uDispCanvas = -1, uFlat = -1;
+LayerLocs gLL{};
+GLint gStrokeLocStroke = -1, gStrokeLocOpacity = -1;
 GLint gStampColor = -1, gStampHardness = -1, gStampCanvas = -1;
 
-// ---------- brush / stroke ----------
+int gWidth = 1, gHeight = 1;  // screen viewport
+int gCw = 0, gCh = 0;         // canvas size
+int gMaxTex = 2048;
+int gMaxLayers = 1;
+
+std::vector<Layer> gLayers;  // bottom -> top
+int gActiveId = -1;
+GLuint gAccTex[2] = {0, 0}, gAccFbo[2] = {0, 0};
+GLuint gFlatTex = 0, gFlatFbo = 0;
+GLuint gStrokeTex = 0, gStrokeFbo = 0;
+
 struct Brush {
     float size = 12, hardness = 0.9f, spacing = 0.06f, flow = 1, sizeP = 1, flowP = 0;
     float r = 0, g = 0, b = 0, opacity = 1;
@@ -133,12 +252,13 @@ Pt gPts[3];
 Pt gDrawn{0, 0, 1};
 int gN = 0;
 bool gStroke = false;
+int gStrokeLayer = -1;
 float gCarry = 0;
 std::vector<float> gStampBuf;
 float gMinX, gMinY, gMaxX, gMaxY;
 
-// ---------- history ----------
 struct HistEntry {
+    int layerId;
     int x, y, w, h;
     std::vector<uint8_t> before, after;
     size_t bytes() const { return before.size() + after.size(); }
@@ -146,7 +266,7 @@ struct HistEntry {
 std::deque<HistEntry> gUndo, gRedo;
 size_t gHistBytes = 0;
 
-// ---------- helpers ----------
+// ---------------------------------------------------------------- helpers
 GLuint compile(GLenum type, const char* src) {
     GLuint sh = glCreateShader(type);
     glShaderSource(sh, 1, &src, nullptr);
@@ -182,18 +302,14 @@ GLuint link(const char* vs, const char* fs) {
     return p;
 }
 
-CompositeLocs compositeLocs(GLuint p) {
-    return {glGetUniformLocation(p, "uLayer"), glGetUniformLocation(p, "uStroke"),
-            glGetUniformLocation(p, "uOpacity"), glGetUniformLocation(p, "uErase"),
-            glGetUniformLocation(p, "uPaper"), glGetUniformLocation(p, "uStrokeActive")};
-}
+GLint loc(GLuint prog, const char* name) { return glGetUniformLocation(prog, name); }
 
-void makeTexture(GLuint& tex, GLuint& fbo) {
+bool makeTex(GLuint& tex, GLuint& fbo, GLint filter) {
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, gCw, gCh);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glGenFramebuffers(1, &fbo);
@@ -201,6 +317,44 @@ void makeTexture(GLuint& tex, GLuint& fbo) {
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
     glClearColor(0, 0, 0, 0);
     glClear(GL_COLOR_BUFFER_BIT);
+    return glGetError() == GL_NO_ERROR;
+}
+
+void destroyTex(GLuint& tex, GLuint& fbo) {
+    if (fbo) glDeleteFramebuffers(1, &fbo);
+    if (tex) glDeleteTextures(1, &tex);
+    fbo = 0;
+    tex = 0;
+}
+
+int findLayer(int id) {
+    for (size_t i = 0; i < gLayers.size(); ++i)
+        if (gLayers[i].id == id) return static_cast<int>(i);
+    return -1;
+}
+
+Rect fullRect() { return Rect{0, 0, gCw, gCh}; }
+
+Rect clampRect(int x0, int y0, int x1, int y1) {
+    x0 = std::max(0, x0);
+    y0 = std::max(0, y0);
+    x1 = std::min(gCw, x1);
+    y1 = std::min(gCh, y1);
+    if (x1 <= x0 || y1 <= y0) return Rect{};
+    return Rect{x0, y0, x1 - x0, y1 - y0};
+}
+
+void readRect(GLuint fbo, const Rect& r, std::vector<uint8_t>& out) {
+    out.resize(static_cast<size_t>(r.w) * r.h * 4);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(r.x, r.y, r.w, r.h, GL_RGBA, GL_UNSIGNED_BYTE, out.data());
+}
+
+void uploadRect(GLuint tex, const Rect& r, const std::vector<uint8_t>& px) {
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, r.x, r.y, r.w, r.h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
 }
 
 void clearStroke() {
@@ -209,20 +363,72 @@ void clearStroke() {
     glClear(GL_COLOR_BUFFER_BIT);
 }
 
-void readRect(GLuint fbo, int x, int y, int w, int h, std::vector<uint8_t>& out) {
-    out.resize(static_cast<size_t>(w) * h * 4);
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, out.data());
-}
-
-void uploadRect(GLuint tex, const HistEntry& e, const std::vector<uint8_t>& px) {
+void bindTex(int unit, GLuint tex) {
+    glActiveTexture(GL_TEXTURE0 + unit);
     glBindTexture(GL_TEXTURE_2D, tex);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, e.x, e.y, e.w, e.h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
 }
 
-// ---------- stamping ----------
+void setLayerUniforms(float opacity, int blend) {
+    glUniform1i(gLL.backdrop, 0);
+    glUniform1i(gLL.layer, 1);
+    glUniform1i(gLL.stroke, 2);
+    glUniform1i(gLL.clip, 3);
+    glUniform1f(gLL.opacity, opacity);
+    glUniform1i(gLL.blend, blend);
+}
+
+// ---------------------------------------------------------------- compositing
+// Recomposites all visible layers inside `r` into the flat texture.
+void recomposite(const Rect& r) {
+    if (!gFlatFbo || r.w <= 0 || r.h <= 0) return;
+    glDisable(GL_BLEND);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(r.x, r.y, r.w, r.h);
+    glViewport(0, 0, gCw, gCh);
+
+    int src = 0, dst = 1;
+    glBindFramebuffer(GL_FRAMEBUFFER, gAccFbo[src]);
+    glClearColor(0, 0, 0, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glUseProgram(gLayerProg);
+    glBindVertexArray(gEmptyVao);
+    for (int i = 0; i < static_cast<int>(gLayers.size()); ++i) {
+        const Layer& L = gLayers[i];
+        if (!L.visible) continue;
+        const Layer* base = nullptr;
+        if (L.clip) {
+            for (int j = i - 1; j >= 0; --j) {
+                if (!gLayers[j].clip) { base = &gLayers[j]; break; }
+            }
+            if (base && !base->visible) continue;  // clipped to a hidden base: hidden too
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, gAccFbo[dst]);
+        bindTex(0, gAccTex[src]);
+        bindTex(1, L.tex);
+        bindTex(2, gStrokeTex);
+        bindTex(3, base ? base->tex : L.tex);
+        setLayerUniforms(L.opacity, L.blend);
+        glUniform1i(gLL.useClip, base ? 1 : 0);
+        const bool strokeOn = gStroke && L.id == gStrokeLayer;
+        glUniform1i(gLL.strokeOn, strokeOn ? 1 : 0);
+        glUniform1f(gLL.strokeOpacity, gBrush.opacity);
+        glUniform1i(gLL.strokeErase, gBrush.erase ? 1 : 0);
+        glUniform1i(gLL.strokeLock, L.alphaLock ? 1 : 0);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        std::swap(src, dst);
+    }
+    glBindVertexArray(0);
+    glDisable(GL_SCISSOR_TEST);
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, gAccFbo[src]);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gFlatFbo);
+    glBlitFramebuffer(r.x, r.y, r.x + r.w, r.y + r.h, r.x, r.y, r.x + r.w, r.y + r.h,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+// ---------------------------------------------------------------- stamping
 float sizeAt(float pressure) {
     float pr = std::clamp(pressure, 0.0f, 1.0f);
     float s = gBrush.size * (1.0f - gBrush.sizeP + gBrush.sizeP * std::max(pr, 0.05f));
@@ -231,6 +437,17 @@ float sizeAt(float pressure) {
 
 void flushStamps() {
     if (gStampBuf.empty()) return;
+    float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
+    for (size_t i = 0; i + 3 < gStampBuf.size(); i += 4) {
+        float h = gStampBuf[i + 2] * 0.5f + 2.0f;
+        minX = std::min(minX, gStampBuf[i] - h);
+        minY = std::min(minY, gStampBuf[i + 1] - h);
+        maxX = std::max(maxX, gStampBuf[i] + h);
+        maxY = std::max(maxY, gStampBuf[i + 1] + h);
+    }
+    Rect dirty = clampRect(static_cast<int>(std::floor(minX)), static_cast<int>(std::floor(minY)),
+                           static_cast<int>(std::ceil(maxX)), static_cast<int>(std::ceil(maxY)));
+
     glBindFramebuffer(GL_FRAMEBUFFER, gStrokeFbo);
     glViewport(0, 0, gCw, gCh);
     glEnable(GL_BLEND);
@@ -246,8 +463,9 @@ void flushStamps() {
     glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, static_cast<GLsizei>(gStampBuf.size() / 4));
     glBindVertexArray(0);
     glDisable(GL_BLEND);
-    glViewport(0, 0, gWidth, gHeight);
     gStampBuf.clear();
+
+    recomposite(dirty);  // live preview of the stroke on the active layer
 }
 
 void stampAt(float x, float y, float pressure) {
@@ -268,7 +486,6 @@ void stampAt(float x, float y, float pressure) {
 
 Pt mid(const Pt& a, const Pt& b) { return {(a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f, (a.p + b.p) * 0.5f}; }
 
-// Walk a quadratic bezier a -> b (control c), emitting stamps every `spacing` px.
 void walk(const Pt& a, const Pt& c, const Pt& b) {
     float len = std::hypot(c.x - a.x, c.y - a.y) + std::hypot(b.x - c.x, b.y - c.y);
     int steps = std::clamp(static_cast<int>(std::ceil(len)), 1, 4096);
@@ -290,6 +507,7 @@ void walk(const Pt& a, const Pt& c, const Pt& b) {
     }
 }
 
+// ---------------------------------------------------------------- history
 void trimHistory() {
     while (!gUndo.empty() && (gUndo.size() > kMaxHistoryEntries || gHistBytes > kMaxHistoryBytes)) {
         gHistBytes -= gUndo.front().bytes();
@@ -297,81 +515,138 @@ void trimHistory() {
     }
 }
 
+void clearHistory() {
+    gUndo.clear();
+    gRedo.clear();
+    gHistBytes = 0;
+}
+
+void purgeHistory(int layerId) {
+    auto purge = [&](std::deque<HistEntry>& q) {
+        for (auto it = q.begin(); it != q.end();) {
+            if (it->layerId == layerId) {
+                gHistBytes -= it->bytes();
+                it = q.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    };
+    purge(gUndo);
+    purge(gRedo);
+}
+
+bool strokeRect(Rect& out) {
+    out = clampRect(static_cast<int>(std::floor(gMinX)), static_cast<int>(std::floor(gMinY)),
+                    static_cast<int>(std::ceil(gMaxX)), static_cast<int>(std::ceil(gMaxY)));
+    return out.w > 0 && out.h > 0;
+}
+
 void commitStroke() {
     flushStamps();
-    int x0 = std::max(0, static_cast<int>(std::floor(gMinX)));
-    int y0 = std::max(0, static_cast<int>(std::floor(gMinY)));
-    int x1 = std::min(gCw, static_cast<int>(std::ceil(gMaxX)));
-    int y1 = std::min(gCh, static_cast<int>(std::ceil(gMaxY)));
+    Rect r;
+    int idx = findLayer(gStrokeLayer);
+    bool ok = idx >= 0 && strokeRect(r);
     gStroke = false;
-    if (x1 <= x0 || y1 <= y0) {
+    if (!ok) {
         clearStroke();
+        recomposite(fullRect());
         return;
     }
-    int src = gCur, dst = 1 - gCur;
-    glBindFramebuffer(GL_FRAMEBUFFER, gFbo[dst]);
+    Layer& L = gLayers[idx];
+
+    HistEntry e;
+    e.layerId = L.id;
+    e.x = r.x; e.y = r.y; e.w = r.w; e.h = r.h;
+    readRect(L.fbo, r, e.before);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, L.fbo);
     glViewport(0, 0, gCw, gCh);
-    glDisable(GL_BLEND);
-    glUseProgram(gCommitProg);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, gTex[src]);
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, gStrokeTex);
-    glUniform1i(gCommit.layer, 0);
-    glUniform1i(gCommit.stroke, 1);
-    glUniform1f(gCommit.opacity, gBrush.opacity);
-    glUniform1f(gCommit.erase, gBrush.erase ? 1.0f : 0.0f);
-    glUniform1f(gCommit.paper, 0.0f);
-    glUniform1f(gCommit.active, 1.0f);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(r.x, r.y, r.w, r.h);
+    glUseProgram(gStrokeProg);
+    bindTex(0, gStrokeTex);
+    glUniform1i(gStrokeLocStroke, 0);
+    glUniform1f(gStrokeLocOpacity, gBrush.opacity);
+    glEnable(GL_BLEND);
+    if (gBrush.erase) {
+        glBlendFunc(GL_ZERO, GL_ONE_MINUS_SRC_ALPHA);
+    } else if (L.alphaLock) {
+        glBlendFuncSeparate(GL_DST_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+    } else {
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    }
     glBindVertexArray(gEmptyVao);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glBindVertexArray(0);
-    glViewport(0, 0, gWidth, gHeight);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
 
-    HistEntry e;
-    e.x = x0; e.y = y0; e.w = x1 - x0; e.h = y1 - y0;
-    readRect(gFbo[src], e.x, e.y, e.w, e.h, e.before);
-    readRect(gFbo[dst], e.x, e.y, e.w, e.h, e.after);
-    for (auto& r : gRedo) gHistBytes -= r.bytes();
+    readRect(L.fbo, r, e.after);
+    for (auto& q : gRedo) gHistBytes -= q.bytes();
     gRedo.clear();
     gHistBytes += e.bytes();
     gUndo.push_back(std::move(e));
     trimHistory();
 
-    gCur = dst;
     clearStroke();
+    recomposite(r);
+}
+
+bool applyHistory(bool undo) {
+    auto& from = undo ? gUndo : gRedo;
+    auto& to = undo ? gRedo : gUndo;
+    while (!from.empty()) {
+        HistEntry e = std::move(from.back());
+        from.pop_back();
+        int idx = findLayer(e.layerId);
+        if (idx < 0) {
+            gHistBytes -= e.bytes();
+            continue;
+        }
+        Rect r{e.x, e.y, e.w, e.h};
+        uploadRect(gLayers[idx].tex, r, undo ? e.before : e.after);
+        recomposite(r);
+        to.push_back(std::move(e));
+        return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------- layers
+void removeLayerInternal(int id) {
+    int idx = findLayer(id);
+    if (idx < 0) return;
+    destroyTex(gLayers[idx].tex, gLayers[idx].fbo);
+    gLayers.erase(gLayers.begin() + idx);
+    purgeHistory(id);
+    if (gActiveId == id) gActiveId = -1;
 }
 
 void releaseCanvas() {
-    for (int i = 0; i < 2; ++i) {
-        if (gFbo[i]) glDeleteFramebuffers(1, &gFbo[i]);
-        if (gTex[i]) glDeleteTextures(1, &gTex[i]);
-        gFbo[i] = 0;
-        gTex[i] = 0;
-    }
-    if (gStrokeFbo) glDeleteFramebuffers(1, &gStrokeFbo);
-    if (gStrokeTex) glDeleteTextures(1, &gStrokeTex);
-    gStrokeFbo = 0;
-    gStrokeTex = 0;
-    gCw = gCh = 0;
-    gUndo.clear();
-    gRedo.clear();
-    gHistBytes = 0;
+    for (auto& l : gLayers) destroyTex(l.tex, l.fbo);
+    gLayers.clear();
+    for (int i = 0; i < 2; ++i) destroyTex(gAccTex[i], gAccFbo[i]);
+    destroyTex(gFlatTex, gFlatFbo);
+    destroyTex(gStrokeTex, gStrokeFbo);
+    clearHistory();
     gStampBuf.clear();
     gStroke = false;
-    gCur = 0;
+    gActiveId = -1;
+    gStrokeLayer = -1;
+    gCw = gCh = 0;
 }
 
-void destroyAll() {
-    gTex[0] = gTex[1] = gFbo[0] = gFbo[1] = 0;   // old context's objects are gone
-    gStrokeTex = gStrokeFbo = 0;
-    gCw = gCh = 0;
-    gUndo.clear();
-    gRedo.clear();
-    gHistBytes = 0;
+void forgetAll() {  // new GL context: old object names are invalid, do not delete them
+    gLayers.clear();
+    gAccTex[0] = gAccTex[1] = gAccFbo[0] = gAccFbo[1] = 0;
+    gFlatTex = gFlatFbo = gStrokeTex = gStrokeFbo = 0;
+    clearHistory();
     gStampBuf.clear();
     gStroke = false;
-    gCur = 0;
+    gActiveId = -1;
+    gStrokeLayer = -1;
+    gCw = gCh = 0;
 }
 
 }  // namespace
@@ -380,22 +655,29 @@ extern "C" {
 
 JNIEXPORT void JNICALL
 Java_com_guhit_studio_engine_NativeEngine_nativeInit(JNIEnv*, jobject) {
-    destroyAll();
-    gDisplayProg = link(kDisplayVs, kCompositeFs);
-    gCommitProg = link(kFullscreenVs, kCompositeFs);
+    forgetAll();
+    gDisplayProg = link(kDisplayVs, kDisplayFs);
+    gLayerProg = link(kFullscreenVs, kLayerFs);
+    gStrokeProg = link(kFullscreenVs, kStrokeFs);
     gStampProg = link(kStampVs, kStampFs);
-    if (!gDisplayProg || !gCommitProg || !gStampProg) return;
+    if (!gDisplayProg || !gLayerProg || !gStrokeProg || !gStampProg) return;
 
-    gDisp.view = glGetUniformLocation(gDisplayProg, "uView");
-    gDisp.t = glGetUniformLocation(gDisplayProg, "uT");
-    gDisp.s = glGetUniformLocation(gDisplayProg, "uS");
-    gDisp.r = glGetUniformLocation(gDisplayProg, "uR");
-    gDisp.canvas = glGetUniformLocation(gDisplayProg, "uCanvas");
-    gDisp.c = compositeLocs(gDisplayProg);
-    gCommit = compositeLocs(gCommitProg);
-    gStampColor = glGetUniformLocation(gStampProg, "uColor");
-    gStampHardness = glGetUniformLocation(gStampProg, "uHardness");
-    gStampCanvas = glGetUniformLocation(gStampProg, "uCanvas");
+    uView = loc(gDisplayProg, "uView");
+    uT = loc(gDisplayProg, "uT");
+    uS = loc(gDisplayProg, "uS");
+    uR = loc(gDisplayProg, "uR");
+    uDispCanvas = loc(gDisplayProg, "uCanvas");
+    uFlat = loc(gDisplayProg, "uFlat");
+
+    gLL = {loc(gLayerProg, "uBackdrop"), loc(gLayerProg, "uLayer"), loc(gLayerProg, "uStroke"),
+           loc(gLayerProg, "uClip"), loc(gLayerProg, "uOpacity"), loc(gLayerProg, "uBlend"),
+           loc(gLayerProg, "uUseClip"), loc(gLayerProg, "uStrokeOn"), loc(gLayerProg, "uStrokeOpacity"),
+           loc(gLayerProg, "uStrokeErase"), loc(gLayerProg, "uStrokeLock")};
+    gStrokeLocStroke = loc(gStrokeProg, "uStroke");
+    gStrokeLocOpacity = loc(gStrokeProg, "uOpacity");
+    gStampColor = loc(gStampProg, "uColor");
+    gStampHardness = loc(gStampProg, "uHardness");
+    gStampCanvas = loc(gStampProg, "uCanvas");
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &gMaxTex);
 
     glGenVertexArrays(1, &gQuadVao);
@@ -417,49 +699,7 @@ Java_com_guhit_studio_engine_NativeEngine_nativeInit(JNIEnv*, jobject) {
     glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, nullptr);
     glVertexAttribDivisor(0, 1);
     glBindVertexArray(0);
-
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-}
-
-// Allocates a blank canvas of w x h (replaces any existing one). False if unsupported.
-JNIEXPORT jboolean JNICALL
-Java_com_guhit_studio_engine_NativeEngine_nativeNewCanvas(JNIEnv*, jobject, jint w, jint h) {
-    if (!gStampProg || w < 1 || h < 1 || w > gMaxTex || h > gMaxTex) return JNI_FALSE;
-    releaseCanvas();
-    gCw = w;
-    gCh = h;
-    while (glGetError() != GL_NO_ERROR) {}
-    makeTexture(gTex[0], gFbo[0]);
-    makeTexture(gTex[1], gFbo[1]);
-    makeTexture(gStrokeTex, gStrokeFbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    if (glGetError() != GL_NO_ERROR) {
-        releaseCanvas();
-        return JNI_FALSE;
-    }
-    const float hw = w / 2.0f, hh = h / 2.0f;
-    const float quad[8] = {-hw, -hh, hw, -hh, -hw, hh, hw, hh};
-    glBindBuffer(GL_ARRAY_BUFFER, gQuadVbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_DYNAMIC_DRAW);
-    return JNI_TRUE;
-}
-
-// Replaces the current layer with premultiplied RGBA pixels (w*h*4 bytes, row 0 = top).
-JNIEXPORT jboolean JNICALL
-Java_com_guhit_studio_engine_NativeEngine_nativeLoadPixels(JNIEnv* env, jobject, jbyteArray in) {
-    if (!gTex[gCur] || gCw <= 0) return JNI_FALSE;
-    const size_t need = static_cast<size_t>(gCw) * gCh * 4;
-    if (static_cast<size_t>(env->GetArrayLength(in)) < need) return JNI_FALSE;
-    jbyte* p = env->GetByteArrayElements(in, nullptr);
-    if (!p) return JNI_FALSE;
-    glBindTexture(GL_TEXTURE_2D, gTex[gCur]);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, gCw, gCh, GL_RGBA, GL_UNSIGNED_BYTE, p);
-    env->ReleaseByteArrayElements(in, p, JNI_ABORT);
-    gUndo.clear();
-    gRedo.clear();
-    gHistBytes = 0;
-    return JNI_TRUE;
 }
 
 JNIEXPORT void JNICALL
@@ -475,35 +715,223 @@ Java_com_guhit_studio_engine_NativeEngine_nativeDraw(JNIEnv*, jobject, jfloat tx
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glViewport(0, 0, gWidth, gHeight);
     glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
     glClearColor(0.11f, 0.11f, 0.12f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
-    if (!gDisplayProg || !gTex[gCur]) return;
+    if (!gDisplayProg || !gFlatTex || gCw <= 0) return;
     glUseProgram(gDisplayProg);
-    glUniform2f(gDisp.canvas, static_cast<float>(gCw), static_cast<float>(gCh));
-    glUniform2f(gDisp.view, static_cast<float>(gWidth), static_cast<float>(gHeight));
-    glUniform2f(gDisp.t, tx, ty);
-    glUniform1f(gDisp.s, scale);
-    glUniform1f(gDisp.r, rotation);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, gTex[gCur]);
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, gStrokeTex);
-    glUniform1i(gDisp.c.layer, 0);
-    glUniform1i(gDisp.c.stroke, 1);
-    glUniform1f(gDisp.c.opacity, gBrush.opacity);
-    glUniform1f(gDisp.c.erase, gBrush.erase ? 1.0f : 0.0f);
-    glUniform1f(gDisp.c.paper, 1.0f);
-    glUniform1f(gDisp.c.active, gStroke ? 1.0f : 0.0f);
+    glUniform2f(uView, static_cast<float>(gWidth), static_cast<float>(gHeight));
+    glUniform2f(uT, tx, ty);
+    glUniform1f(uS, scale);
+    glUniform1f(uR, rotation);
+    glUniform2f(uDispCanvas, static_cast<float>(gCw), static_cast<float>(gCh));
+    bindTex(0, gFlatTex);
+    glUniform1i(uFlat, 0);
     glBindVertexArray(gQuadVao);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glBindVertexArray(0);
 }
 
+// Allocates an empty canvas (no layers yet) of w x h. False if unsupported.
+JNIEXPORT jboolean JNICALL
+Java_com_guhit_studio_engine_NativeEngine_nativeNewCanvas(JNIEnv*, jobject, jint w, jint h) {
+    if (!gStampProg || w < 1 || h < 1 || w > gMaxTex || h > gMaxTex) return JNI_FALSE;
+    releaseCanvas();
+    gCw = w;
+    gCh = h;
+    while (glGetError() != GL_NO_ERROR) {}
+    bool ok = makeTex(gAccTex[0], gAccFbo[0], GL_NEAREST) && makeTex(gAccTex[1], gAccFbo[1], GL_NEAREST) &&
+              makeTex(gFlatTex, gFlatFbo, GL_LINEAR) && makeTex(gStrokeTex, gStrokeFbo, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (!ok) {
+        releaseCanvas();
+        return JNI_FALSE;
+    }
+    const size_t perTexture = static_cast<size_t>(w) * h * 4;
+    gMaxLayers = std::clamp(static_cast<int>(kTextureBudgetBytes / perTexture) - kFixedTextures, 1, 100);
+    const float hw = w / 2.0f, hh = h / 2.0f;
+    const float quad[8] = {-hw, -hh, hw, -hh, -hw, hh, hw, hh};
+    glBindBuffer(GL_ARRAY_BUFFER, gQuadVbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_DYNAMIC_DRAW);
+    return JNI_TRUE;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_guhit_studio_engine_NativeEngine_nativeMaxLayers(JNIEnv*, jobject) {
+    return gMaxLayers;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_guhit_studio_engine_NativeEngine_nativeAddLayer(JNIEnv*, jobject, jint id, jint index,
+                                                         jboolean force) {
+    if (gCw <= 0 || findLayer(id) >= 0) return JNI_FALSE;
+    if (force != JNI_TRUE && static_cast<int>(gLayers.size()) >= gMaxLayers) return JNI_FALSE;
+    while (glGetError() != GL_NO_ERROR) {}
+    Layer l;
+    l.id = id;
+    if (!makeTex(l.tex, l.fbo, GL_NEAREST)) {
+        destroyTex(l.tex, l.fbo);
+        return JNI_FALSE;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    int at = std::clamp(static_cast<int>(index), 0, static_cast<int>(gLayers.size()));
+    gLayers.insert(gLayers.begin() + at, l);
+    recomposite(fullRect());
+    return JNI_TRUE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_guhit_studio_engine_NativeEngine_nativeDuplicateLayer(JNIEnv*, jobject, jint srcId, jint newId,
+                                                               jint index) {
+    int s = findLayer(srcId);
+    if (s < 0 || findLayer(newId) >= 0 || static_cast<int>(gLayers.size()) >= gMaxLayers) return JNI_FALSE;
+    while (glGetError() != GL_NO_ERROR) {}
+    Layer l = gLayers[s];
+    l.id = newId;
+    l.tex = 0;
+    l.fbo = 0;
+    if (!makeTex(l.tex, l.fbo, GL_NEAREST)) {
+        destroyTex(l.tex, l.fbo);
+        return JNI_FALSE;
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, gLayers[s].fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, l.fbo);
+    glBlitFramebuffer(0, 0, gCw, gCh, 0, 0, gCw, gCh, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    int at = std::clamp(static_cast<int>(index), 0, static_cast<int>(gLayers.size()));
+    gLayers.insert(gLayers.begin() + at, l);
+    recomposite(fullRect());
+    return JNI_TRUE;
+}
+
 JNIEXPORT void JNICALL
-Java_com_guhit_studio_engine_NativeEngine_nativeSetBrush(JNIEnv*, jobject, jfloat size,
-                                                         jfloat hardness, jfloat spacing,
-                                                         jfloat flow, jfloat sizeP, jfloat flowP,
-                                                         jfloat r, jfloat g, jfloat b,
+Java_com_guhit_studio_engine_NativeEngine_nativeRemoveLayer(JNIEnv*, jobject, jint id) {
+    if (gStroke) return;
+    removeLayerInternal(id);
+    recomposite(fullRect());
+}
+
+JNIEXPORT void JNICALL
+Java_com_guhit_studio_engine_NativeEngine_nativeMoveLayer(JNIEnv*, jobject, jint id, jint index) {
+    int from = findLayer(id);
+    if (from < 0 || gStroke) return;
+    Layer l = gLayers[from];
+    gLayers.erase(gLayers.begin() + from);
+    int at = std::clamp(static_cast<int>(index), 0, static_cast<int>(gLayers.size()));
+    gLayers.insert(gLayers.begin() + at, l);
+    recomposite(fullRect());
+}
+
+JNIEXPORT void JNICALL
+Java_com_guhit_studio_engine_NativeEngine_nativeSetLayerProps(JNIEnv*, jobject, jint id, jboolean visible,
+                                                              jfloat opacity, jint blend, jboolean alphaLock,
+                                                              jboolean clip) {
+    int i = findLayer(id);
+    if (i < 0) return;
+    Layer& l = gLayers[i];
+    l.visible = visible == JNI_TRUE;
+    l.opacity = std::clamp(static_cast<float>(opacity), 0.0f, 1.0f);
+    l.blend = blend;
+    l.alphaLock = alphaLock == JNI_TRUE;
+    l.clip = clip == JNI_TRUE;
+    recomposite(fullRect());
+}
+
+JNIEXPORT void JNICALL
+Java_com_guhit_studio_engine_NativeEngine_nativeSetActive(JNIEnv*, jobject, jint id) {
+    if (gStroke) return;
+    gActiveId = id;
+}
+
+// Draws `upper` onto `lower` (using upper's opacity/blend), deletes `upper`. Not undoable.
+JNIEXPORT jboolean JNICALL
+Java_com_guhit_studio_engine_NativeEngine_nativeMergeDown(JNIEnv*, jobject, jint upperId, jint lowerId) {
+    int u = findLayer(upperId), l = findLayer(lowerId);
+    if (u < 0 || l < 0 || gStroke) return JNI_FALSE;
+    if (gLayers[u].visible) {
+        const Layer up = gLayers[u];
+        const Layer lo = gLayers[l];
+        glDisable(GL_BLEND);
+        glDisable(GL_SCISSOR_TEST);
+        glViewport(0, 0, gCw, gCh);
+        glBindFramebuffer(GL_FRAMEBUFFER, gAccFbo[1]);
+        glUseProgram(gLayerProg);
+        bindTex(0, lo.tex);
+        bindTex(1, up.tex);
+        bindTex(2, gStrokeTex);
+        bindTex(3, up.tex);
+        setLayerUniforms(up.opacity, up.blend);
+        glUniform1i(gLL.useClip, 0);
+        glUniform1i(gLL.strokeOn, 0);
+        glUniform1f(gLL.strokeOpacity, 1.0f);
+        glUniform1i(gLL.strokeErase, 0);
+        glUniform1i(gLL.strokeLock, 0);
+        glBindVertexArray(gEmptyVao);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glBindVertexArray(0);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, gAccFbo[1]);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, lo.fbo);
+        glBlitFramebuffer(0, 0, gCw, gCh, 0, 0, gCw, gCh, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+    purgeHistory(lowerId);
+    removeLayerInternal(upperId);
+    recomposite(fullRect());
+    return JNI_TRUE;
+}
+
+// Loads premultiplied RGBA (w*h*4, row 0 = top) into a layer. Call nativeRecompositeAll afterwards.
+JNIEXPORT jboolean JNICALL
+Java_com_guhit_studio_engine_NativeEngine_nativeLoadLayerPixels(JNIEnv* env, jobject, jint id,
+                                                                jbyteArray in) {
+    int i = findLayer(id);
+    if (i < 0 || gCw <= 0) return JNI_FALSE;
+    const size_t need = static_cast<size_t>(gCw) * gCh * 4;
+    if (static_cast<size_t>(env->GetArrayLength(in)) < need) return JNI_FALSE;
+    jbyte* p = env->GetByteArrayElements(in, nullptr);
+    if (!p) return JNI_FALSE;
+    glBindTexture(GL_TEXTURE_2D, gLayers[i].tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, gCw, gCh, GL_RGBA, GL_UNSIGNED_BYTE, p);
+    env->ReleaseByteArrayElements(in, p, JNI_ABORT);
+    clearHistory();
+    return JNI_TRUE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_guhit_studio_engine_NativeEngine_nativeRecompositeAll(JNIEnv*, jobject) {
+    recomposite(fullRect());
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_guhit_studio_engine_NativeEngine_nativeReadLayerPixels(JNIEnv* env, jobject, jint id,
+                                                                jbyteArray out) {
+    int i = findLayer(id);
+    if (i < 0 || gCw <= 0) return JNI_FALSE;
+    const jsize need = gCw * gCh * 4;
+    if (env->GetArrayLength(out) < need) return JNI_FALSE;
+    std::vector<uint8_t> buf;
+    readRect(gLayers[i].fbo, fullRect(), buf);
+    env->SetByteArrayRegion(out, 0, need, reinterpret_cast<const jbyte*>(buf.data()));
+    return JNI_TRUE;
+}
+
+// The flattened picture (all visible layers), premultiplied, transparent background.
+JNIEXPORT jboolean JNICALL
+Java_com_guhit_studio_engine_NativeEngine_nativeReadFlat(JNIEnv* env, jobject, jbyteArray out) {
+    if (!gFlatFbo || gCw <= 0) return JNI_FALSE;
+    const jsize need = gCw * gCh * 4;
+    if (env->GetArrayLength(out) < need) return JNI_FALSE;
+    std::vector<uint8_t> buf;
+    readRect(gFlatFbo, fullRect(), buf);
+    env->SetByteArrayRegion(out, 0, need, reinterpret_cast<const jbyte*>(buf.data()));
+    return JNI_TRUE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_guhit_studio_engine_NativeEngine_nativeSetBrush(JNIEnv*, jobject, jfloat size, jfloat hardness,
+                                                         jfloat spacing, jfloat flow, jfloat sizeP,
+                                                         jfloat flowP, jfloat r, jfloat g, jfloat b,
                                                          jfloat opacity, jboolean erase) {
     if (gStroke) return;
     gBrush.size = size;
@@ -521,8 +949,9 @@ Java_com_guhit_studio_engine_NativeEngine_nativeSetBrush(JNIEnv*, jobject, jfloa
 
 JNIEXPORT void JNICALL
 Java_com_guhit_studio_engine_NativeEngine_nativeStrokeBegin(JNIEnv*, jobject) {
-    if (!gStampProg || !gTex[0]) return;
+    if (!gStampProg || findLayer(gActiveId) < 0) return;
     gStroke = true;
+    gStrokeLayer = gActiveId;
     gN = 0;
     gCarry = 0;
     gStampBuf.clear();
@@ -562,9 +991,7 @@ Java_com_guhit_studio_engine_NativeEngine_nativeStrokeAdd(JNIEnv*, jobject, jflo
 JNIEXPORT void JNICALL
 Java_com_guhit_studio_engine_NativeEngine_nativeStrokeEnd(JNIEnv*, jobject) {
     if (!gStroke) return;
-    if (gN >= 2) {
-        walk(gDrawn, mid(gDrawn, gPts[1]), gPts[1]);
-    }
+    if (gN >= 2) walk(gDrawn, mid(gDrawn, gPts[1]), gPts[1]);
     commitStroke();
 }
 
@@ -572,28 +999,23 @@ JNIEXPORT void JNICALL
 Java_com_guhit_studio_engine_NativeEngine_nativeStrokeCancel(JNIEnv*, jobject) {
     if (!gStroke) return;
     gStampBuf.clear();
+    Rect r;
+    bool had = strokeRect(r);
     gStroke = false;
     clearStroke();
+    if (had) recomposite(r);
 }
 
 JNIEXPORT jboolean JNICALL
 Java_com_guhit_studio_engine_NativeEngine_nativeUndo(JNIEnv*, jobject) {
-    if (gStroke || gUndo.empty()) return JNI_FALSE;
-    HistEntry e = std::move(gUndo.back());
-    gUndo.pop_back();
-    uploadRect(gTex[gCur], e, e.before);
-    gRedo.push_back(std::move(e));
-    return JNI_TRUE;
+    if (gStroke) return JNI_FALSE;
+    return applyHistory(true) ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jboolean JNICALL
 Java_com_guhit_studio_engine_NativeEngine_nativeRedo(JNIEnv*, jobject) {
-    if (gStroke || gRedo.empty()) return JNI_FALSE;
-    HistEntry e = std::move(gRedo.back());
-    gRedo.pop_back();
-    uploadRect(gTex[gCur], e, e.after);
-    gUndo.push_back(std::move(e));
-    return JNI_TRUE;
+    if (gStroke) return JNI_FALSE;
+    return applyHistory(false) ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jint JNICALL
@@ -604,18 +1026,6 @@ Java_com_guhit_studio_engine_NativeEngine_nativeUndoCount(JNIEnv*, jobject) {
 JNIEXPORT jint JNICALL
 Java_com_guhit_studio_engine_NativeEngine_nativeRedoCount(JNIEnv*, jobject) {
     return static_cast<jint>(gRedo.size());
-}
-
-// Fills `out` (w*h*4 bytes) with premultiplied RGBA, row 0 = canvas top.
-JNIEXPORT jboolean JNICALL
-Java_com_guhit_studio_engine_NativeEngine_nativeReadPixels(JNIEnv* env, jobject, jbyteArray out) {
-    if (!gFbo[gCur] || gCw <= 0) return JNI_FALSE;
-    const jsize need = gCw * gCh * 4;
-    if (env->GetArrayLength(out) < need) return JNI_FALSE;
-    std::vector<uint8_t> buf;
-    readRect(gFbo[gCur], 0, 0, gCw, gCh, buf);
-    env->SetByteArrayRegion(out, 0, need, reinterpret_cast<const jbyte*>(buf.data()));
-    return JNI_TRUE;
 }
 
 }  // extern "C"

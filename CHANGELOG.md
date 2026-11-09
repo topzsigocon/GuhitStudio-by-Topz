@@ -1,6 +1,26 @@
 # Changelog
 Format: Keep a Changelog, SemVer.
 
+## [0.4.0] - M2: Layers
+### Added
+- Layers: add, duplicate, delete, reorder, rename, show/hide, select. Layer panel under the top bar.
+- Per-layer opacity and 18 blend modes (Normal, Multiply, Darken, Color Burn, Linear Burn, Screen,
+  Lighten, Color Dodge, Add, Overlay, Soft Light, Hard Light, Difference, Exclusion, Hue, Saturation,
+  Color, Luminosity).
+- Alpha lock, clipping mask (clips to the nearest non-clipped layer below), lock layer.
+- Merge Down.
+- Layer limit depends on canvas size (shown as n/max).
+- `.guhit` format v2: every layer is stored with its settings. v1/v0.3 files open normally.
+- Saving/loading streams one layer at a time (low memory).
+- Export uses the flattened picture (all visible layers).
+### Changed
+- Engine renderer: per-layer GPU textures, dirty-rect recompositing, strokes are committed in place.
+### Known gaps
+- Undo/redo covers strokes only (per layer). Adding, deleting, moving, merging layers and changing layer
+  settings are NOT undoable yet (delete and merge ask for confirmation).
+- No layer thumbnails, groups, masks or multi-select yet (M2b).
+- Clipping mask assumes the base layer is Normal/100%.
+
 ## [0.3.1]
 ### Fixed
 - Opacity (and color, eraser, finger mode) changes were only sent to the engine after the size slider

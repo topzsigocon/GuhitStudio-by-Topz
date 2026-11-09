@@ -10,11 +10,25 @@ object NativeEngine {
     external fun nativeResize(width: Int, height: Int)
     external fun nativeDraw(tx: Float, ty: Float, scale: Float, rotation: Float)
 
-    /** Allocates a blank canvas. Returns false if the size is unsupported by this GPU. */
+    /** Allocates an empty canvas with no layers. False if the size is unsupported by this GPU. */
     external fun nativeNewCanvas(width: Int, height: Int): Boolean
+    external fun nativeMaxLayers(): Int
 
-    /** Premultiplied RGBA, row 0 = top, width*height*4 bytes. */
-    external fun nativeLoadPixels(pixels: ByteArray): Boolean
+    external fun nativeAddLayer(id: Int, index: Int, force: Boolean): Boolean
+    external fun nativeDuplicateLayer(srcId: Int, newId: Int, index: Int): Boolean
+    external fun nativeRemoveLayer(id: Int)
+    external fun nativeMoveLayer(id: Int, index: Int)
+    external fun nativeSetLayerProps(
+        id: Int, visible: Boolean, opacity: Float, blend: Int, alphaLock: Boolean, clip: Boolean,
+    )
+    external fun nativeSetActive(id: Int)
+    external fun nativeMergeDown(upperId: Int, lowerId: Int): Boolean
+
+    /** Premultiplied RGBA, row 0 = top, width*height*4 bytes. Follow with nativeRecompositeAll. */
+    external fun nativeLoadLayerPixels(id: Int, pixels: ByteArray): Boolean
+    external fun nativeRecompositeAll()
+    external fun nativeReadLayerPixels(id: Int, out: ByteArray): Boolean
+    external fun nativeReadFlat(out: ByteArray): Boolean
 
     external fun nativeSetBrush(
         size: Float, hardness: Float, spacing: Float, flow: Float,
@@ -31,6 +45,4 @@ object NativeEngine {
     external fun nativeRedo(): Boolean
     external fun nativeUndoCount(): Int
     external fun nativeRedoCount(): Int
-
-    external fun nativeReadPixels(out: ByteArray): Boolean
 }

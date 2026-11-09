@@ -16,3 +16,8 @@ so a blank canvas can never overwrite a good save.
 
 Planned: tiled layer data with LZ4 (M2+), multiple layers, bumping `version`. Readers must
 reject unknown versions.
+
+## Update (M2): format v2
+`manifest.json` version 2 adds `activeLayer` and per-layer `id`, `file` (`layer<ID>.rgba`), `name`, `visible`,
+`opacity`, `blend` (BlendMode id), `alphaLock`, `clip`, `locked`. The manifest is the first ZIP entry so layers can
+be streamed. v1 (`layer0.rgba`, no ids) is still read: ids are assigned in order, settings default.

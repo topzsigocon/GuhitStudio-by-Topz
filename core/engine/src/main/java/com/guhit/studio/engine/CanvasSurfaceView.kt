@@ -24,7 +24,8 @@ enum class FingerMode { DRAW, NAVIGATE }
  *  - Finger (or stylus) draws with the current [brush]; finger pressure is simulated from speed.
  *  - Two fingers: pan / pinch-zoom / rotate. Two-finger tap = undo, three-finger tap = redo.
  *  - When a stylus is first seen, fingers switch to navigation (palm friendly).
- *  - Call [openDocument] to set the canvas size and (optionally) load saved pixels.
+ *  - Layers: the view owns a [LayerStack] and mirrors every change to the GPU.
+ *  - Open a document with [openDocument] -> [loadLayerPixels] (per layer) -> [finishLoading].
  */
 class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
 
@@ -49,7 +50,34 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
     var onContextRecreated: (() -> Unit)? = null
 
     // ---- document state ----
-    private class DocState(val w: Int, val h: Int, val pixels: ByteArray?)
+    private class DocState(val w: Int, val h: Int, val layers: List<Layer>, val activeId: Int)
+
+    // ---- layers (UI thread owns the model; the GL thread mirrors it) ----
+    private val stack = LayerStack()
+    val layers: List<Layer> get() = stack.layers
+    val activeLayerId: Int get() = stack.activeId
+
+    /** How many layers this canvas size allows on this device (set when the canvas is created). */
+    @Volatile
+    var maxLayers: Int = 1
+        private set
+
+    /** Bumped on add/remove/move/merge/open. Savers use it to detect structural changes mid-save. */
+    @Volatile
+    var structureVersion: Int = 0
+        private set
+
+    var onLayersChanged: ((layers: List<Layer>, activeId: Int) -> Unit)? = null
+
+    /** The GPU canvas and (empty) layers exist: the app can now stream saved pixels in. */
+    var onDocumentReady: (() -> Unit)? = null
+
+    /** User touched the canvas while the active layer is locked or hidden. */
+    var onDrawBlocked: (() -> Unit)? = null
+
+    /** Tried to add a layer beyond [maxLayers]. */
+    var onLayerLimit: (() -> Unit)? = null
+    private var blockedTouch = false
 
     private val lock = Any()
     private var pendingDoc: DocState? = null
@@ -145,16 +173,36 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
 
     // ---------------------------------------------------------------- public API
 
-    /** Creates the canvas (w x h) and optionally loads premultiplied RGBA pixels into it. */
-    fun openDocument(w: Int, h: Int, pixels: ByteArray?) {
+    /**
+     * Creates the canvas (w x h) with the given EMPTY layers. Drawing stays blocked until
+     * [finishLoading]. [onDocumentReady] fires when the GPU side is ready for [loadLayerPixels].
+     */
+    fun openDocument(w: Int, h: Int, layers: List<Layer>, activeId: Int) {
         canvasW = w
         canvasH = h
         if (width > 0 && height > 0) resetView() else hasTransform = false
+        contentValid = false
+        stack.reset(layers, activeId)
+        structureVersion++
+        notifyLayers()
         synchronized(lock) {
-            pendingDoc = DocState(w, h, pixels)
+            pendingDoc = DocState(w, h, layers, stack.activeId)
             if (glReady) queueEvent { applyPendingDoc() }
         }
         requestRender()
+    }
+
+    /** Uploads saved pixels (premultiplied RGBA, canvas-size) into layer [id]. */
+    fun loadLayerPixels(id: Int, pixels: ByteArray, onDone: () -> Unit) = gl {
+        NativeEngine.nativeLoadLayerPixels(id, pixels)
+        ui.post { onDone() }
+    }
+
+    /** Call after all layer pixels were loaded (or immediately for a blank document). */
+    fun finishLoading() = gl {
+        NativeEngine.nativeRecompositeAll()
+        contentValid = true
+        reportHistory(false)
     }
 
     fun resetView() {
@@ -175,17 +223,123 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
     }
 
     /**
-     * Premultiplied RGBA, canvas-top-first, width*height*4 bytes. Callback runs on the UI thread
-     * with null if the content is not valid (e.g. while reloading after a GL context loss).
+     * The flattened picture (all visible layers), premultiplied RGBA, canvas-top-first,
+     * width*height*4 bytes. Callback on the UI thread; null if the content is not valid
+     * (e.g. while loading or reloading after a GL context loss).
      */
-    fun exportPixels(onDone: (ByteArray?) -> Unit) = gl {
+    fun exportFlat(onDone: (ByteArray?) -> Unit) = gl {
         if (!contentValid) {
             ui.post { onDone(null) }
         } else {
             val buf = ByteArray(canvasW * canvasH * 4)
-            val ok = NativeEngine.nativeReadPixels(buf)
+            val ok = NativeEngine.nativeReadFlat(buf)
             ui.post { onDone(if (ok) buf else null) }
         }
+    }
+
+    /** One layer's pixels (premultiplied RGBA). Null if invalid or the layer no longer exists. */
+    fun readLayer(id: Int, onDone: (ByteArray?) -> Unit) = gl {
+        if (!contentValid) {
+            ui.post { onDone(null) }
+        } else {
+            val buf = ByteArray(canvasW * canvasH * 4)
+            val ok = NativeEngine.nativeReadLayerPixels(id, buf)
+            ui.post { onDone(if (ok) buf else null) }
+        }
+    }
+
+    // ---- layer operations (UI thread) ----
+
+    fun addLayer(): Boolean {
+        if (!contentValid) return false
+        if (stack.layers.size >= maxLayers) {
+            onLayerLimit?.invoke()
+            return false
+        }
+        val l = stack.add()
+        val idx = stack.indexOf(l.id)
+        structureChanged()
+        gl {
+            NativeEngine.nativeAddLayer(l.id, idx, false)
+            NativeEngine.nativeSetActive(l.id)
+        }
+        return true
+    }
+
+    fun duplicateLayer(id: Int): Boolean {
+        if (!contentValid) return false
+        if (stack.layers.size >= maxLayers) {
+            onLayerLimit?.invoke()
+            return false
+        }
+        val d = stack.duplicate(id) ?: return false
+        val idx = stack.indexOf(d.id)
+        structureChanged()
+        gl {
+            NativeEngine.nativeDuplicateLayer(id, d.id, idx)
+            NativeEngine.nativeSetActive(d.id)
+        }
+        return true
+    }
+
+    fun deleteLayer(id: Int): Boolean {
+        if (!contentValid || !stack.remove(id)) return false
+        val newActive = stack.activeId
+        structureChanged()
+        gl {
+            NativeEngine.nativeRemoveLayer(id)
+            NativeEngine.nativeSetActive(newActive)
+            reportHistory(false)
+        }
+        return true
+    }
+
+    /** delta +1 = up one position, -1 = down. */
+    fun moveLayer(id: Int, delta: Int) {
+        if (!contentValid) return
+        val idx = stack.move(id, delta) ?: return
+        structureChanged()
+        gl { NativeEngine.nativeMoveLayer(id, idx) }
+    }
+
+    /** Merges the layer into the one below it. Not undoable. */
+    fun mergeLayerDown(id: Int): Boolean {
+        if (!contentValid) return false
+        val (upper, lower) = stack.mergeDown(id) ?: return false
+        structureChanged()
+        gl {
+            NativeEngine.nativeMergeDown(upper.id, lower.id)
+            NativeEngine.nativeSetActive(lower.id)
+            reportHistory(false)
+        }
+        return true
+    }
+
+    fun selectLayer(id: Int) {
+        if (stack.indexOf(id) < 0) return
+        stack.select(id)
+        notifyLayers()
+        gl { NativeEngine.nativeSetActive(id) }
+    }
+
+    /** Change opacity, blend, visibility, locks, name... */
+    fun updateLayer(id: Int, transform: (Layer) -> Layer) {
+        val l = stack.update(id, transform) ?: return
+        notifyLayers()
+        onContentChanged?.invoke()
+        gl {
+            NativeEngine.nativeSetLayerProps(l.id, l.visible, l.opacity, l.blend.id, l.alphaLock, l.clip)
+        }
+    }
+
+    private fun structureChanged() {
+        structureVersion++
+        notifyLayers()
+        onContentChanged?.invoke()
+    }
+
+    private fun notifyLayers() {
+        onLayersChanged?.invoke(stack.layers, stack.activeId)
     }
 
     // ---------------------------------------------------------------- helpers
@@ -195,17 +349,24 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
         requestRender()
     }
 
-    /** GL thread: apply a queued document (new canvas + optional pixels). */
+    /** GL thread: apply a queued document (new canvas + empty layers). */
     private fun applyPendingDoc() {
         val d = synchronized(lock) {
             val x = pendingDoc
             pendingDoc = null
             x
         } ?: return
-        val ok = NativeEngine.nativeNewCanvas(d.w, d.h) &&
-            (d.pixels == null || NativeEngine.nativeLoadPixels(d.pixels))
-        contentValid = ok
-        if (!ok) ui.post { onCanvasError?.invoke() }
+        var ok = NativeEngine.nativeNewCanvas(d.w, d.h)
+        if (ok) {
+            for ((i, l) in d.layers.withIndex()) {
+                if (!NativeEngine.nativeAddLayer(l.id, i, true)) ok = false
+                NativeEngine.nativeSetLayerProps(l.id, l.visible, l.opacity, l.blend.id, l.alphaLock, l.clip)
+            }
+            NativeEngine.nativeSetActive(d.activeId)
+            maxLayers = NativeEngine.nativeMaxLayers()
+        }
+        contentValid = false // becomes true in finishLoading()
+        ui.post { if (ok) onDocumentReady?.invoke() else onCanvasError?.invoke() }
         reportHistory(false)
     }
 
@@ -267,6 +428,20 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
     private fun onFirstDown(e: MotionEvent) {
         if (!contentValid) {
             mode = Mode.IDLE
+            return
+        }
+        val activeLayer = stack.active
+        blockedTouch = activeLayer == null || activeLayer.locked || !activeLayer.visible
+        if (blockedTouch) {
+            // Two-finger navigation and tap gestures still work; a lone tap reports the block.
+            ui.removeCallbacks(flush)
+            pending.clear()
+            tracking = false
+            maxPointers = 1
+            travel = 0f
+            gestureStart = e.eventTime
+            recordDown(e)
+            mode = Mode.NAVIGATING
             return
         }
         ui.removeCallbacks(flush)
@@ -367,6 +542,7 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
                 val quick = e.eventTime - gestureStart < TAP_MS && travel < TAP_SLOP_PX
                 if (!cancel && e.actionMasked == MotionEvent.ACTION_UP && quick) {
                     when (maxPointers) {
+                        1 -> if (blockedTouch) onDrawBlocked?.invoke()
                         2 -> undo()
                         3 -> redo()
                     }

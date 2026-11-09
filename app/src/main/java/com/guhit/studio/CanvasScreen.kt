@@ -63,10 +63,12 @@ import com.guhit.studio.engine.BrushMath
 import com.guhit.studio.engine.BrushPresets
 import com.guhit.studio.engine.CanvasSurfaceView
 import com.guhit.studio.engine.FingerMode
+import com.guhit.studio.engine.Layer
 import java.util.Locale
+import java.util.concurrent.Executors
 import kotlin.math.roundToInt
 
-private enum class Panel { None, Brushes, Color, Actions }
+private enum class Panel { None, Brushes, Color, Layers, Actions }
 
 /** 1% steps; the top of the slider snaps to exactly 100% so the stroke is fully opaque. */
 private fun snapOpacity(v: Float): Float {
@@ -74,41 +76,22 @@ private fun snapOpacity(v: Float): Float {
     return if (r >= 0.97f) 1f else r.coerceAtLeast(0.01f)
 }
 
-/** Loads the artwork's pixels from disk, then shows the editor. */
 @Composable
 fun CanvasScreen(artwork: Artwork, onClose: () -> Unit) {
-    val context = LocalContext.current
-    var pixels by remember(artwork.id) { mutableStateOf<ByteArray?>(null) }
-    var ready by remember(artwork.id) { mutableStateOf(false) }
-
-    LaunchedEffect(artwork.id) {
-        Thread {
-            val px = ArtworkRepository.loadPixels(context, artwork)
-            Handler(Looper.getMainLooper()).post {
-                pixels = px
-                ready = true
-            }
-        }.start()
-    }
-    // Free the extra copy once the editor owns the pixels.
-    LaunchedEffect(ready) { if (ready) pixels = null }
-
-    if (!ready) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            CircularProgressIndicator()
-        }
-    } else {
-        EditorContent(artwork, pixels, onClose)
-    }
+    EditorContent(artwork, onClose)
 }
 
-/** Debounced + on-demand autosave. Snapshots are taken on the GL thread, written off the UI thread. */
+/**
+ * Debounced + on-demand autosave. Layers are saved one at a time (read on the GL thread, written on
+ * an IO thread) so memory stays at about one layer no matter how many layers exist.
+ */
 private class Saver(
     private val context: Context,
     private val art: Artwork,
     private val canvas: CanvasSurfaceView,
 ) {
     private val main = Handler(Looper.getMainLooper())
+    private val io = Executors.newSingleThreadExecutor()
     private var dirty = false
     private var running = false
     private var rerun = false
@@ -122,6 +105,8 @@ private class Saver(
     }
 
     fun cancelTimer() = main.removeCallbacks(debounce)
+
+    fun shutdown() = io.shutdown() // lets queued writes finish
 
     /** Saves if there are unsaved changes, then calls [onDone] (also when nothing needed saving). */
     fun request(onDone: () -> Unit) {
@@ -138,27 +123,92 @@ private class Saver(
             finish()
             return
         }
+        val layers = canvas.layers
+        if (layers.isEmpty()) {
+            finish()
+            return
+        }
         running = true
         dirty = false
-        canvas.exportPixels { px ->
-            if (px == null) {
-                dirty = true
-                running = false
-                finish()
-                return@exportPixels
+        val version = canvas.structureVersion
+        val active = canvas.activeLayerId
+        io.execute {
+            val session = try {
+                ArtworkRepository.beginSave(context, art, layers, active)
+            } catch (e: Exception) {
+                null
             }
-            Thread {
-                ArtworkRepository.save(context, art, px)
-                main.post {
-                    running = false
-                    if (rerun) {
-                        rerun = false
-                        start()
-                    } else {
-                        finish()
+            main.post {
+                if (session == null) fail(retry = false) else step(session, layers, 0, version)
+            }
+        }
+    }
+
+    private fun step(session: ArtworkRepository.SaveSession, layers: List<Layer>, i: Int, version: Int) {
+        if (canvas.structureVersion != version) { // layers were added/removed/moved mid-save
+            io.execute { session.abort() }
+            fail(retry = true)
+            return
+        }
+        if (i >= layers.size) {
+            canvas.exportFlat { flat ->
+                io.execute {
+                    val ok = try {
+                        session.commit(flat)
+                        true
+                    } catch (e: Exception) {
+                        session.abort()
+                        false
                     }
+                    main.post { if (ok) done() else fail(retry = false) }
                 }
-            }.start()
+            }
+            return
+        }
+        val layer = layers[i]
+        canvas.readLayer(layer.id) { px ->
+            if (px == null) {
+                io.execute { session.abort() }
+                fail(retry = false)
+            } else {
+                io.execute {
+                    val ok = try {
+                        session.writeLayer(layer, px)
+                        true
+                    } catch (e: Exception) {
+                        session.abort()
+                        false
+                    }
+                    main.post { if (ok) step(session, layers, i + 1, version) else fail(retry = false) }
+                }
+            }
+        }
+    }
+
+    private fun done() {
+        running = false
+        if (rerun) {
+            rerun = false
+            start()
+        } else {
+            finish()
+        }
+    }
+
+    private fun fail(retry: Boolean) {
+        running = false
+        dirty = true
+        if (retry) {
+            if (rerun) {
+                rerun = false
+                start()
+            } else {
+                main.postDelayed(debounce, 1000)
+                finish()
+            }
+        } else {
+            rerun = false
+            finish()
         }
     }
 
@@ -174,19 +224,63 @@ private class Saver(
 }
 
 @Composable
-private fun EditorContent(artwork: Artwork, initialPixels: ByteArray?, onClose: () -> Unit) {
+private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
     val context = LocalContext.current
-    val canvas = remember {
-        CanvasSurfaceView(context).also { it.openDocument(artwork.width, artwork.height, initialPixels) }
-    }
+    val canvas = remember { CanvasSurfaceView(context) }
     val saver = remember { Saver(context, artwork, canvas) }
+    val io = remember { Executors.newSingleThreadExecutor() }
+    val main = remember { Handler(Looper.getMainLooper()) }
+    val sessionHolder = remember { arrayOfNulls<ArtworkRepository.LoadSession>(1) }
+    var loading by remember { mutableStateOf(true) }
     var closing by remember { mutableStateOf(false) }
+    var layers by remember { mutableStateOf<List<Layer>>(emptyList()) }
+    var activeLayerId by remember { mutableIntStateOf(-1) }
 
     fun closeEditor() {
         if (closing) return
         closing = true
         saver.cancelTimer()
         saver.request { onClose() }
+    }
+
+    // Streams saved layers into the GPU one at a time (low memory).
+    fun streamNext(session: ArtworkRepository.LoadSession) {
+        io.execute {
+            val next = try {
+                session.next()
+            } catch (e: Exception) {
+                null
+            }
+            main.post {
+                if (next == null) {
+                    try { session.close() } catch (_: Exception) {}
+                    sessionHolder[0] = null
+                    canvas.finishLoading()
+                    loading = false
+                } else {
+                    canvas.loadLayerPixels(next.first, next.second) { streamNext(session) }
+                }
+            }
+        }
+    }
+
+    fun startLoad() {
+        loading = true
+        io.execute {
+            val session = try {
+                ArtworkRepository.openLoad(context, artwork)
+            } catch (e: Exception) {
+                null
+            }
+            main.post {
+                sessionHolder[0] = session
+                if (session == null) {
+                    canvas.openDocument(artwork.width, artwork.height, listOf(Layer(1, "Layer 1")), 1)
+                } else {
+                    canvas.openDocument(session.width, session.height, session.layers, session.activeId)
+                }
+            }
+        }
     }
 
     var panel by remember { mutableStateOf(Panel.None) }
@@ -238,25 +332,40 @@ private fun EditorContent(artwork: Artwork, initialPixels: ByteArray?, onClose: 
             Toast.makeText(context, R.string.stylus_detected, Toast.LENGTH_LONG).show()
         }
         canvas.onContentChanged = { saver.markDirty() }
+        canvas.onLayersChanged = { l, a ->
+            layers = l
+            activeLayerId = a
+        }
+        canvas.onDocumentReady = {
+            val session = sessionHolder[0]
+            if (session == null) {
+                canvas.finishLoading()
+                loading = false
+            } else {
+                streamNext(session)
+            }
+        }
+        canvas.onLayerLimit = { Toast.makeText(context, R.string.layer_limit, Toast.LENGTH_LONG).show() }
+        canvas.onDrawBlocked = { Toast.makeText(context, R.string.draw_blocked, Toast.LENGTH_SHORT).show() }
         canvas.onCanvasError = {
             Toast.makeText(context, R.string.canvas_error, Toast.LENGTH_LONG).show()
             onClose()
         }
-        canvas.onContextRecreated = {
-            // GPU memory was lost: reload the last saved version.
-            Thread {
-                val px = ArtworkRepository.loadPixels(context, artwork)
-                Handler(Looper.getMainLooper()).post {
-                    canvas.openDocument(artwork.width, artwork.height, px)
-                }
-            }.start()
-        }
+        // GPU memory was lost: reload the last saved version (drawing/saving stay blocked meanwhile).
+        canvas.onContextRecreated = { startLoad() }
+        startLoad()
         onDispose {
             lifecycle.removeObserver(observer)
             saver.cancelTimer()
+            saver.shutdown()
+            io.shutdown()
             canvas.onHistoryChanged = null
             canvas.onStylusDetected = null
             canvas.onContentChanged = null
+            canvas.onLayersChanged = null
+            canvas.onDocumentReady = null
+            canvas.onLayerLimit = null
+            canvas.onDrawBlocked = null
             canvas.onCanvasError = null
             canvas.onContextRecreated = null
         }
@@ -265,10 +374,10 @@ private fun EditorContent(artwork: Artwork, initialPixels: ByteArray?, onClose: 
     // Export (system file picker, so no storage permission is needed).
     fun runExport(uri: Uri?, format: ExportFormat) {
         if (uri == null) return
-        canvas.exportPixels { pixels ->
+        canvas.exportFlat { pixels ->
             if (pixels == null) {
                 Toast.makeText(context, R.string.export_failed, Toast.LENGTH_SHORT).show()
-                return@exportPixels
+                return@exportFlat
             }
             Thread {
                 val ok = ExportHelper.save(context, uri, pixels, artwork.width, artwork.height, format)
@@ -323,6 +432,9 @@ private fun EditorContent(artwork: Artwork, initialPixels: ByteArray?, onClose: 
                 FloatingBar {
                     TextButton(onClick = ::closeEditor) { Text(stringResource(R.string.gallery)) }
                     TextButton(onClick = { toggle(Panel.Brushes) }) { Text(preset.name) }
+                    TextButton(onClick = { toggle(Panel.Layers) }) {
+                        Text(stringResource(R.string.layers_btn, layers.size))
+                    }
                     TextButton(
                         onClick = { erase = !erase },
                         colors = ButtonDefaults.textButtonColors(
@@ -348,13 +460,25 @@ private fun EditorContent(artwork: Artwork, initialPixels: ByteArray?, onClose: 
             }
 
             AnimatedVisibility(visible = panel != Panel.None) {
-                PopupPanel {
+                PopupPanel(width = if (panel == Panel.Layers) 330.dp else 300.dp) {
                     when (panel) {
                         Panel.Brushes -> BrushList(selectedId = presetId) {
                             presetId = it
                             panel = Panel.None
                         }
                         Panel.Color -> ColorPickerPanel(color = color, onColorChange = { color = it })
+                        Panel.Layers -> LayersPanel(
+                            layers = layers,
+                            activeId = activeLayerId,
+                            maxLayers = canvas.maxLayers,
+                            onSelect = canvas::selectLayer,
+                            onAdd = { canvas.addLayer() },
+                            onUpdate = canvas::updateLayer,
+                            onDuplicate = { canvas.duplicateLayer(it) },
+                            onDelete = { canvas.deleteLayer(it) },
+                            onMergeDown = { canvas.mergeLayerDown(it) },
+                            onMove = canvas::moveLayer,
+                        )
                         Panel.Actions -> ActionsList(
                             fingerDraws = fingerDraws,
                             onFingerDraws = { fingerDraws = it },
@@ -443,7 +567,7 @@ private fun EditorContent(artwork: Artwork, initialPixels: ByteArray?, onClose: 
             }
         }
 
-        if (closing) {
+        if (closing || loading) {
             Box(
                 Modifier
                     .fillMaxSize()
@@ -457,7 +581,7 @@ private fun EditorContent(artwork: Artwork, initialPixels: ByteArray?, onClose: 
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     CircularProgressIndicator()
-                    Text(stringResource(R.string.saving))
+                    Text(stringResource(if (closing) R.string.saving else R.string.opening))
                 }
             }
         }

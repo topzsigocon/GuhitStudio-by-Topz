@@ -34,4 +34,19 @@
     <string name="saving">Sine-save…</string>
     <string name="opening">Binubuksan…</string>
     <string name="canvas_error">Hindi kayang gawin ng device na ito ang ganitong kalaking canvas.</string>
+    <string name="layers_btn">Layer %1$d</string>
+    <string name="layers_title">Mga Layer (%1$d/%2$d)</string>
+    <string name="new_layer">＋ Bagong layer</string>
+    <string name="layer_opacity">Opacity ng layer: %1$d%%</string>
+    <string name="layer_blend">Blend mode: %1$s ▾</string>
+    <string name="alpha_lock">Alpha lock</string>
+    <string name="clipping_mask">Clipping mask</string>
+    <string name="lock_layer">Naka-lock</string>
+    <string name="move_up">▲ Pataas</string>
+    <string name="move_down">▼ Pababa</string>
+    <string name="merge_down">Merge Down</string>
+    <string name="delete_layer_confirm">Buburahin ang layer na “%1$s”. Hindi na ito mababawi gamit ang undo.</string>
+    <string name="merge_confirm">Isasama ang “%1$s” sa layer sa ibaba nito. Hindi na ito mababawi gamit ang undo.</string>
+    <string name="layer_limit">Naabot na ang pinakamaraming layer para sa laki ng canvas na ito.</string>
+    <string name="draw_blocked">Naka-lock o nakatago ang napiling layer.</string>
 </resources>
