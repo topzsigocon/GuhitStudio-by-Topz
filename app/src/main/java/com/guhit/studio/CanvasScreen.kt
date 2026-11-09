@@ -499,6 +499,7 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
                 onClick = { barVisible = !barVisible },
                 shape = RoundedCornerShape(bottomStart = 12.dp, bottomEnd = 12.dp),
                 color = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f),
+                contentColor = MaterialTheme.colorScheme.onSurface,
                 modifier = Modifier.padding(top = 2.dp),
             ) {
                 Text(
@@ -518,6 +519,7 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
                 Surface(
                     shape = RoundedCornerShape(20.dp),
                     color = MaterialTheme.colorScheme.surface.copy(alpha = 0.92f),
+                    contentColor = MaterialTheme.colorScheme.onSurface,
                     tonalElevation = 4.dp,
                 ) {
                     Column(
@@ -558,6 +560,7 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
                 onClick = { sideVisible = !sideVisible },
                 shape = RoundedCornerShape(topEnd = 12.dp, bottomEnd = 12.dp),
                 color = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f),
+                contentColor = MaterialTheme.colorScheme.onSurface,
             ) {
                 Text(
                     text = if (sideVisible) "\u25C0" else "\u25B6",

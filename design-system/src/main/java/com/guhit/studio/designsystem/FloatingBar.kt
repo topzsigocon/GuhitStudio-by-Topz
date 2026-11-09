@@ -28,6 +28,7 @@ fun FloatingBar(
         modifier = modifier,
         shape = RoundedCornerShape(bottomStart = 16.dp, bottomEnd = 16.dp),
         color = MaterialTheme.colorScheme.surface.copy(alpha = 0.92f),
+        contentColor = MaterialTheme.colorScheme.onSurface,
         tonalElevation = 4.dp,
     ) {
         Row(
@@ -50,7 +51,8 @@ fun PopupPanel(
     Surface(
         modifier = modifier.width(width).padding(top = 4.dp),
         shape = RoundedCornerShape(16.dp),
-        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
+        color = MaterialTheme.colorScheme.surface,
+        contentColor = MaterialTheme.colorScheme.onSurface,
         tonalElevation = 6.dp,
     ) {
         Column(

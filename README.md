@@ -2,7 +2,7 @@
 
 Native Android digital painting app. 100% offline, no ads, no accounts. (Working name.)
 
-**Status:** M2 - layers (v0.4.0). See the master prompt for the full roadmap (M0-M11).
+**Status:** M2 - layers (v0.4.1). See the master prompt for the full roadmap (M0-M11).
 
 ## Build (GitHub)
 1. Push this repo to GitHub (branch `main`).
@@ -15,6 +15,11 @@ Requires JDK 17, Android SDK 35, NDK + CMake 3.22.1 (Android Studio installs the
 gradle wrapper --gradle-version 8.10.2   # once, then commit gradlew files
 ./gradlew assembleDebug
 ```
+
+## Updating without uninstalling
+All builds are signed with the same personal key (`app/signing/guhit-personal.p12`), so Android accepts each new
+APK as an update and keeps your artworks. Keep this repo PRIVATE: anyone with the key can sign apps that Android
+will treat as updates of this one. If you ever publish the app, create a new key and store it in GitHub Secrets.
 
 ## Release
 Add repo secrets `KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`, then:

@@ -1,6 +1,18 @@
 # Changelog
 Format: Keep a Changelog, SemVer.
 
+## [0.4.1]
+### Added
+- App icon (adaptive + Android 13 themed icon) from the supplied brush artwork. Source and generator:
+  `docs/branding/icon-source.png`, `tools/make_icons.py`.
+- Fixed personal signing key (`app/signing/guhit-personal.p12`). Every build is now signed with the same
+  key, so new versions install OVER the old one: no more uninstalling, and drawings are kept.
+### Fixed
+- Text in pop-ups, side panel and handles was black on dark (hard to read). Content color is now explicit.
+- Pop-up panels are fully opaque (the canvas no longer shows through).
+### Note
+- The first install of this version still needs ONE uninstall (older builds used random debug keys).
+
 ## [0.4.0] - M2: Layers
 ### Added
 - Layers: add, duplicate, delete, reorder, rename, show/hide, select. Layer panel under the top bar.
