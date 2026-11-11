@@ -10,6 +10,10 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.border
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -19,7 +23,9 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -27,6 +33,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -49,16 +57,20 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import com.guhit.studio.designsystem.BottomSheetPanel
+import com.guhit.studio.designsystem.BottomToolbar
 import com.guhit.studio.designsystem.ColorPickerPanel
-import com.guhit.studio.designsystem.FloatingBar
-import com.guhit.studio.designsystem.PopupPanel
-import com.guhit.studio.designsystem.VerticalSlider
+import com.guhit.studio.designsystem.GuhitColors
+import com.guhit.studio.designsystem.ToolbarButton
+import com.guhit.studio.designsystem.TopBar
+import com.guhit.studio.designsystem.ValueSlider
 import com.guhit.studio.engine.BrushMath
 import com.guhit.studio.engine.BrushPresets
 import com.guhit.studio.engine.CanvasSurfaceView
@@ -293,6 +305,8 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
     var color by remember { mutableStateOf(Color.Black) }
     var erase by remember { mutableStateOf(false) }
     var fingerDraws by remember { mutableStateOf(true) }
+    var showFps by remember { mutableStateOf(false) }
+    var fps by remember { mutableFloatStateOf(0f) }
     var undoCount by remember { mutableIntStateOf(0) }
     var redoCount by remember { mutableIntStateOf(0) }
 
@@ -307,6 +321,7 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
     SideEffect {
         canvas.brush = brushSettings
         canvas.fingerMode = fingerMode
+        canvas.fpsEnabled = showFps
     }
 
     // GL lifecycle + callbacks from the engine.
@@ -331,6 +346,7 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
             fingerDraws = false
             Toast.makeText(context, R.string.stylus_detected, Toast.LENGTH_LONG).show()
         }
+        canvas.onFps = { fps = it }
         canvas.onContentChanged = { saver.markDirty() }
         canvas.onLayersChanged = { l, a ->
             layers = l
@@ -362,6 +378,7 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
             canvas.onHistoryChanged = null
             canvas.onStylusDetected = null
             canvas.onContentChanged = null
+            canvas.onFps = null
             canvas.onLayersChanged = null
             canvas.onDocumentReady = null
             canvas.onLayerLimit = null
@@ -414,7 +431,7 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
     Box(Modifier.fillMaxSize()) {
         AndroidView(factory = { canvas }, modifier = Modifier.fillMaxSize())
 
-        // Tap outside a pop-up to close it.
+        // Tap outside a sheet to close it.
         if (panel != Panel.None) {
             Box(
                 Modifier
@@ -423,44 +440,61 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
             )
         }
 
-        // ------------------------------------------------ top: collapsible tool bar + pop-ups
+        // ------------------------------------------------ top: bar (back / undo / redo / ... / menu)
         Column(
-            modifier = Modifier.align(Alignment.TopCenter).statusBarsPadding(),
+            modifier = Modifier.align(Alignment.TopCenter),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            AnimatedVisibility(visible = barVisible) {
-                FloatingBar {
-                    TextButton(onClick = ::closeEditor) { Text(stringResource(R.string.gallery)) }
-                    TextButton(onClick = { toggle(Panel.Brushes) }) { Text(preset.name) }
-                    TextButton(onClick = { toggle(Panel.Layers) }) {
-                        Text(stringResource(R.string.layers_btn, layers.size))
+            AnimatedVisibility(
+                visible = barVisible,
+                enter = slideInVertically { -it } + fadeIn(),
+                exit = slideOutVertically { -it } + fadeOut(),
+            ) {
+                TopBar {
+                    IconButton(onClick = ::closeEditor) {
+                        Icon(painterResource(R.drawable.ic_back), stringResource(R.string.gallery))
                     }
-                    TextButton(
-                        onClick = { erase = !erase },
-                        colors = ButtonDefaults.textButtonColors(
-                            contentColor = if (erase) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
-                        ),
-                    ) {
-                        Text(
-                            stringResource(R.string.tool_eraser),
-                            fontWeight = if (erase) FontWeight.Bold else FontWeight.Normal,
-                        )
+                    IconButton(onClick = canvas::undo, enabled = undoCount > 0) {
+                        Icon(painterResource(R.drawable.ic_undo), stringResource(R.string.undo_desc))
                     }
-                    Box(
-                        Modifier
-                            .padding(horizontal = 8.dp)
-                            .size(30.dp)
-                            .clip(CircleShape)
-                            .background(color)
-                            .border(2.dp, Color.White.copy(alpha = 0.7f), CircleShape)
-                            .clickable { toggle(Panel.Color) },
-                    )
-                    TextButton(onClick = { toggle(Panel.Actions) }) { Text(stringResource(R.string.menu_more)) }
+                    IconButton(onClick = canvas::redo, enabled = redoCount > 0) {
+                        Icon(painterResource(R.drawable.ic_redo), stringResource(R.string.redo_desc))
+                    }
+                    Spacer(Modifier.weight(1f))
+                    IconButton(onClick = canvas::resetView) {
+                        Icon(painterResource(R.drawable.ic_fit), stringResource(R.string.reset_view))
+                    }
+                    IconButton(onClick = { toggle(Panel.Actions) }) {
+                        Icon(painterResource(R.drawable.ic_menu), stringResource(R.string.menu_desc))
+                    }
                 }
             }
+            // Hide/show both bars to get the whole screen for drawing.
+            Surface(
+                onClick = { barVisible = !barVisible },
+                shape = RoundedCornerShape(bottomStart = 12.dp, bottomEnd = 12.dp),
+                color = GuhitColors.Navy900.copy(alpha = 0.9f),
+                contentColor = GuhitColors.Gold,
+            ) {
+                Text(
+                    text = if (barVisible) "\u25B2" else "\u25BC",
+                    modifier = Modifier.padding(horizontal = 22.dp, vertical = 2.dp),
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
+        }
 
-            AnimatedVisibility(visible = panel != Panel.None) {
-                PopupPanel(width = if (panel == Panel.Layers) 330.dp else 300.dp) {
+        // ------------------------------------------------ bottom: sheet, sliders, tool row
+        Column(
+            modifier = Modifier.align(Alignment.BottomCenter),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            AnimatedVisibility(
+                visible = panel != Panel.None,
+                enter = slideInVertically { it } + fadeIn(),
+                exit = slideOutVertically { it } + fadeOut(),
+            ) {
+                BottomSheetPanel(scroll = panel != Panel.Layers) {
                     when (panel) {
                         Panel.Brushes -> BrushList(selectedId = presetId) {
                             presetId = it
@@ -482,6 +516,8 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
                         Panel.Actions -> ActionsList(
                             fingerDraws = fingerDraws,
                             onFingerDraws = { fingerDraws = it },
+                            showFps = showFps,
+                            onShowFps = { showFps = it },
                             onResetView = {
                                 canvas.resetView()
                                 panel = Panel.None
@@ -495,86 +531,86 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
                 }
             }
 
-            Surface(
-                onClick = { barVisible = !barVisible },
-                shape = RoundedCornerShape(bottomStart = 12.dp, bottomEnd = 12.dp),
-                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f),
-                contentColor = MaterialTheme.colorScheme.onSurface,
-                modifier = Modifier.padding(top = 2.dp),
+            AnimatedVisibility(
+                visible = barVisible,
+                enter = slideInVertically { it } + fadeIn(),
+                exit = slideOutVertically { it } + fadeOut(),
             ) {
-                Text(
-                    text = if (barVisible) "\u25B2" else "\u25BC",
-                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 2.dp),
-                    style = MaterialTheme.typography.labelSmall,
-                )
-            }
-        }
-
-        // ------------------------------------------------ left: collapsible sliders + undo/redo
-        Row(
-            modifier = Modifier.align(Alignment.CenterStart).padding(start = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            AnimatedVisibility(visible = sideVisible) {
-                Surface(
-                    shape = RoundedCornerShape(20.dp),
-                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.92f),
-                    contentColor = MaterialTheme.colorScheme.onSurface,
-                    tonalElevation = 4.dp,
-                ) {
-                    Column(
-                        modifier = Modifier.padding(8.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                Column(Modifier.navigationBarsPadding()) {
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .background(GuhitColors.Navy900.copy(alpha = 0.55f))
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                Text(
-                                    String.format(Locale.US, "%.0f", sizePx),
-                                    style = MaterialTheme.typography.labelSmall,
-                                )
-                                VerticalSlider(value = sizeValue, onValueChange = { sizeValue = it })
-                                Text(stringResource(R.string.label_size), style = MaterialTheme.typography.labelSmall)
-                            }
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                Text(
-                                    String.format(Locale.US, "%.0f%%", opacity * 100f),
-                                    style = MaterialTheme.typography.labelSmall,
-                                )
-                                VerticalSlider(value = opacity, onValueChange = { opacity = snapOpacity(it) })
-                                Text(stringResource(R.string.label_opacity), style = MaterialTheme.typography.labelSmall)
-                            }
-                        }
-                        Row {
-                            TextButton(onClick = canvas::undo, enabled = undoCount > 0) {
-                                Text(stringResource(R.string.undo), style = MaterialTheme.typography.titleLarge)
-                            }
-                            TextButton(onClick = canvas::redo, enabled = redoCount > 0) {
-                                Text(stringResource(R.string.redo), style = MaterialTheme.typography.titleLarge)
-                            }
+                        ValueSlider(
+                            label = stringResource(R.string.label_size),
+                            valueText = "${sizePx.roundToInt()} px",
+                            value = sizeValue,
+                            onValueChange = { sizeValue = it },
+                            modifier = Modifier.weight(1f),
+                        )
+                        ValueSlider(
+                            label = stringResource(R.string.label_opacity),
+                            valueText = "${(opacity * 100).roundToInt()}%",
+                            value = opacity,
+                            onValueChange = { opacity = snapOpacity(it) },
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                    BottomToolbar {
+                        ToolbarButton(
+                            label = stringResource(R.string.tool_brush),
+                            selected = panel == Panel.Brushes,
+                            onClick = { toggle(Panel.Brushes) },
+                        ) { tint -> Icon(painterResource(R.drawable.ic_brush), null, tint = tint) }
+                        ToolbarButton(
+                            label = stringResource(R.string.tool_eraser),
+                            selected = erase,
+                            onClick = { erase = !erase },
+                        ) { tint -> Icon(painterResource(R.drawable.ic_eraser), null, tint = tint) }
+                        ToolbarButton(
+                            label = stringResource(R.string.layers_btn, layers.size),
+                            selected = panel == Panel.Layers,
+                            onClick = { toggle(Panel.Layers) },
+                        ) { tint -> Icon(painterResource(R.drawable.ic_layers), null, tint = tint) }
+                        ToolbarButton(
+                            label = stringResource(R.string.tool_color),
+                            selected = panel == Panel.Color,
+                            onClick = { toggle(Panel.Color) },
+                        ) { tint ->
+                            Box(
+                                Modifier
+                                    .size(22.dp)
+                                    .clip(CircleShape)
+                                    .background(color)
+                                    .border(2.dp, tint, CircleShape),
+                            )
                         }
                     }
                 }
             }
-            Surface(
-                onClick = { sideVisible = !sideVisible },
-                shape = RoundedCornerShape(topEnd = 12.dp, bottomEnd = 12.dp),
-                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f),
-                contentColor = MaterialTheme.colorScheme.onSurface,
-            ) {
-                Text(
-                    text = if (sideVisible) "\u25C0" else "\u25B6",
-                    modifier = Modifier.padding(horizontal = 3.dp, vertical = 18.dp),
-                    style = MaterialTheme.typography.labelSmall,
-                )
-            }
+        }
+
+        if (showFps) {
+            Text(
+                text = String.format(Locale.US, "%.0f FPS", fps),
+                style = MaterialTheme.typography.labelMedium,
+                color = Color.White,
+                modifier = Modifier
+                    .align(Alignment.CenterStart)
+                    .padding(8.dp)
+                    .background(Color(0x99000000), RoundedCornerShape(8.dp))
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+            )
         }
 
         if (closing || loading) {
             Box(
                 Modifier
                     .fillMaxSize()
-                    .background(Color(0xAA000000))
+                    .background(Color(0xCC05070D))
                     .pointerInput(Unit) {
                         awaitPointerEventScope {
                             while (true) awaitPointerEvent().changes.forEach { it.consume() }
@@ -613,6 +649,8 @@ private fun BrushList(selectedId: String, onSelect: (String) -> Unit) {
 private fun ActionsList(
     fingerDraws: Boolean,
     onFingerDraws: (Boolean) -> Unit,
+    showFps: Boolean,
+    onShowFps: (Boolean) -> Unit,
     onResetView: () -> Unit,
     onExportPng: () -> Unit,
     onExportPngWhite: () -> Unit,
@@ -628,6 +666,14 @@ private fun ActionsList(
             Text(stringResource(R.string.finger_draws_hint), style = MaterialTheme.typography.bodySmall)
         }
         Switch(checked = fingerDraws, onCheckedChange = onFingerDraws)
+    }
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Text(stringResource(R.string.show_fps), fontWeight = FontWeight.Medium)
+        Switch(checked = showFps, onCheckedChange = onShowFps)
     }
     ActionRow(stringResource(R.string.reset_view), onResetView)
     ActionRow(stringResource(R.string.export_png), onExportPng)

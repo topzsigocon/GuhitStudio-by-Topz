@@ -2,7 +2,7 @@
 
 Native Android digital painting app. 100% offline, no ads, no accounts. (Working name.)
 
-**Status:** M2 - layers (v0.4.1). See the master prompt for the full roadmap (M0-M11).
+**Status:** M2 - layers, new UI (v0.5.0). See the master prompt for the full roadmap (M0-M11).
 
 ## Build (GitHub)
 1. Push this repo to GitHub (branch `main`).
@@ -32,7 +32,7 @@ then `base64 -w0 release.jks` for the secret. Never commit the keystore.
 ## Try it
 - One finger (or stylus): draw. Two fingers: pan / pinch-zoom / rotate.
 - Two-finger tap: undo. Three-finger tap: redo.
-- Top bar: brush list, eraser, color, menu (export, finger mode, reset view). Handles collapse the panels.
+- Top bar: back to gallery, undo, redo, fit view, menu (export, finger mode, FPS). Bottom: size/opacity sliders and tools (Brush, Eraser, Layers, Color). The gold handle hides/shows the bars.
 - Menu -> Export saves a PNG/JPEG through the system file picker.
 - "Layer" button: layer list, opacity, blend modes, alpha lock, clipping mask, lock, merge, reorder.
 - Your work is autosaved. The gallery (home) lists all artworks; use "Bagong Canvas" for new ones.

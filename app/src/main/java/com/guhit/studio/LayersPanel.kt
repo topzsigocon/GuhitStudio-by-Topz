@@ -15,6 +15,8 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
@@ -31,6 +33,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -39,7 +42,7 @@ import com.guhit.studio.engine.BlendMode
 import com.guhit.studio.engine.Layer
 import kotlin.math.roundToInt
 
-/** Layer list (top layer first) + options for the selected layer. Meant to live in a PopupPanel. */
+/** Layer list (top layer first) + options for the selected layer. Meant to live in a BottomSheetPanel(scroll = false). */
 @Composable
 fun LayersPanel(
     layers: List<Layer>,
@@ -53,7 +56,7 @@ fun LayersPanel(
     onMergeDown: (Int) -> Unit,
     onMove: (Int, Int) -> Unit,
 ) {
-    val maxHeight = (LocalConfiguration.current.screenHeightDp * 0.62f).dp
+    val maxHeight = (LocalConfiguration.current.screenHeightDp * 0.5f).dp
     val sel = layers.firstOrNull { it.id == activeId }
     val selIndex = layers.indexOfFirst { it.id == activeId }
 
@@ -86,8 +89,12 @@ fun LayersPanel(
                     .padding(horizontal = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                TextButton(onClick = { onUpdate(l.id) { it.copy(visible = !it.visible) } }) {
-                    Text(if (l.visible) "◉" else "○")
+                IconButton(onClick = { onUpdate(l.id) { it.copy(visible = !it.visible) } }) {
+                    Icon(
+                        painterResource(if (l.visible) R.drawable.ic_eye else R.drawable.ic_eye_off),
+                        contentDescription = null,
+                        tint = if (l.visible) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
                 Column(Modifier.weight(1f).padding(vertical = 4.dp)) {
                     Text(

@@ -49,4 +49,10 @@
     <string name="merge_confirm">Isasama ang “%1$s” sa layer sa ibaba nito. Hindi na ito mababawi gamit ang undo.</string>
     <string name="layer_limit">Naabot na ang pinakamaraming layer para sa laki ng canvas na ito.</string>
     <string name="draw_blocked">Naka-lock o nakatago ang napiling layer.</string>
+    <string name="show_fps">Ipakita ang FPS (sukatan ng bilis)</string>
+    <string name="tool_brush">Brush</string>
+    <string name="tool_color">Kulay</string>
+    <string name="undo_desc">I-undo</string>
+    <string name="redo_desc">I-redo</string>
+    <string name="menu_desc">Menu</string>
 </resources>

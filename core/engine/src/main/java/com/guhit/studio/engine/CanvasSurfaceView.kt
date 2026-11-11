@@ -40,6 +40,15 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
     var onHistoryChanged: ((undo: Int, redo: Int) -> Unit)? = null
     var onStylusDetected: (() -> Unit)? = null
 
+    /** Average frames per second while drawing/panning (reported about every 0.5 s on the UI thread). */
+    var onFps: ((Float) -> Unit)? = null
+
+    @Volatile
+    var fpsEnabled = false
+    private var lastFrameNs = 0L
+    private var fpsFrames = 0
+    private var fpsTimeNs = 0L
+
     /** Fired (UI thread) after a stroke is committed or after undo/redo: the artwork changed. */
     var onContentChanged: (() -> Unit)? = null
 
@@ -139,6 +148,10 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
     private var outX = 0f
     private var outY = 0f
 
+    // Points are collected per touch event and sent to the GL thread as ONE event (x, y, pressure triples).
+    private var batch = FloatArray(3 * 128)
+    private var batchN = 0 // number of floats used
+
     init {
         setEGLContextClientVersion(3)
         preserveEGLContextOnPause = true
@@ -166,6 +179,21 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
             override fun onDrawFrame(gl: GL10?) {
                 val t = transform
                 NativeEngine.nativeDraw(t.tx, t.ty, t.scale, t.rotation)
+                if (fpsEnabled) {
+                    val now = System.nanoTime()
+                    val dt = now - lastFrameNs
+                    lastFrameNs = now
+                    if (dt in 1..200_000_000L) { // ignore idle gaps between strokes
+                        fpsFrames++
+                        fpsTimeNs += dt
+                        if (fpsTimeNs >= 500_000_000L) {
+                            val fps = fpsFrames * 1_000_000_000f / fpsTimeNs
+                            fpsFrames = 0
+                            fpsTimeNs = 0
+                            ui.post { onFps?.invoke(fps) }
+                        }
+                    }
+                }
             }
         })
         renderMode = RENDERMODE_WHEN_DIRTY
@@ -510,6 +538,7 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
                     )
                 }
                 addRaw(RawPt(e.getX(idx), e.getY(idx), e.getPressure(idx), e.eventTime))
+                if (mode == Mode.DRAWING) sendBatch()
             }
             Mode.NAVIGATING -> when {
                 e.pointerCount >= 2 -> handleTwoFingers(e)
@@ -580,6 +609,7 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
         pEma = if (strokeIsFinger) 0.6f else first.pressure.coerceIn(0f, 1f)
         lastPressure = pEma
         pointCount = 0
+        batchN = 0
         gl {
             NativeEngine.nativeSetBrush(
                 b.sizePx, b.hardness, b.spacing, b.flow, b.sizePressure, b.flowPressure,
@@ -591,6 +621,7 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
         val list = ArrayList(pending)
         pending.clear()
         for (p in list) feed(p)
+        sendBatch()
     }
 
     private fun feed(p: RawPt) {
@@ -616,25 +647,51 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
         lastPressure = pressure
 
         toCanvas(fx, fy)
-        val cx = outX
-        val cy = outY
-        gl { NativeEngine.nativeStrokeAdd(cx, cy, pressure) }
+        appendPoint(outX, outY, pressure)
+    }
+
+    private fun appendPoint(x: Float, y: Float, pressure: Float) {
+        if (batchN + 3 > batch.size) batch = batch.copyOf(batch.size * 2)
+        batch[batchN++] = x
+        batch[batchN++] = y
+        batch[batchN++] = pressure
+    }
+
+    /** Sends the collected points in one GL event and draws them (one flush + recomposite). */
+    private fun sendBatch() {
+        val data = batch.copyOf(batchN)
+        batchN = 0
+        gl {
+            var i = 0
+            while (i < data.size) {
+                NativeEngine.nativeStrokeAdd(data[i], data[i + 1], data[i + 2])
+                i += 3
+            }
+            NativeEngine.nativeStrokeFlush()
+        }
     }
 
     private fun finishStroke() {
         // Close the gap left by the smoothing filter.
         toCanvas(lastRawX, lastRawY)
-        val cx = outX
-        val cy = outY
-        val pressure = lastPressure
+        appendPoint(outX, outY, lastPressure)
+        val data = batch.copyOf(batchN)
+        batchN = 0
         gl {
-            NativeEngine.nativeStrokeAdd(cx, cy, pressure)
+            var i = 0
+            while (i < data.size) {
+                NativeEngine.nativeStrokeAdd(data[i], data[i + 1], data[i + 2])
+                i += 3
+            }
             NativeEngine.nativeStrokeEnd()
             reportHistory(true)
         }
     }
 
-    private fun cancelStroke() = gl { NativeEngine.nativeStrokeCancel() }
+    private fun cancelStroke() {
+        batchN = 0
+        gl { NativeEngine.nativeStrokeCancel() }
+    }
 
     // ---------------------------------------------------------------- navigation
 

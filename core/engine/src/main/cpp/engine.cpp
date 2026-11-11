@@ -7,8 +7,9 @@
 //
 //  Strokes: stamps -> stroke buffer (opacity applied later). While drawing, the active layer's pass
 //  includes the stroke (live preview). On commit the stroke is blended INTO the layer in place with
-//  fixed-function blending (normal / erase / alpha lock). Undo stores before/after pixels of the
-//  stroke rect per layer.
+//  fixed-function blending (normal / erase / alpha lock). Undo keeps the stroke rect's previous pixels
+//  in a small GPU texture (GPU->GPU blits, no CPU readback, no stall); undo/redo swap that texture with
+//  the layer region. Stamps are batched: one flush + recomposite per touch event, not per point.
 //
 // Texture row 0 == canvas TOP. Canvas pixel coords: (0,0) top-left, y down.
 #include <jni.h>
@@ -190,7 +191,7 @@ void main() {
 )";
 
 const char* kStampFs = R"(#version 300 es
-precision highp float;
+precision mediump float;
 in vec2 vLocal;
 in float vAlpha;
 in float vHalf;
@@ -199,6 +200,7 @@ uniform float uHardness;
 out vec4 outColor;
 void main() {
     float r = length(vLocal);
+    if (r >= 1.0) discard;
     float soft = clamp(1.5 / max(vHalf, 0.5), 0.0, 1.0);
     float h = max(min(uHardness, 1.0 - soft), 0.0);
     float a = (1.0 - smoothstep(h, 1.0, r)) * vAlpha;
@@ -258,10 +260,10 @@ std::vector<float> gStampBuf;
 float gMinX, gMinY, gMaxX, gMaxY;
 
 struct HistEntry {
-    int layerId;
-    int x, y, w, h;
-    std::vector<uint8_t> before, after;
-    size_t bytes() const { return before.size() + after.size(); }
+    int layerId = 0;
+    Rect r;
+    GLuint tex = 0, fbo = 0;  // pixels of `r` that are currently NOT in the layer (swapped on undo/redo)
+    size_t bytes() const { return static_cast<size_t>(r.w) * r.h * 4; }
 };
 std::deque<HistEntry> gUndo, gRedo;
 size_t gHistBytes = 0;
@@ -351,10 +353,32 @@ void readRect(GLuint fbo, const Rect& r, std::vector<uint8_t>& out) {
     glReadPixels(r.x, r.y, r.w, r.h, GL_RGBA, GL_UNSIGNED_BYTE, out.data());
 }
 
-void uploadRect(GLuint tex, const Rect& r, const std::vector<uint8_t>& px) {
+// Allocates a w x h RGBA8 texture + FBO for holding a copy of a layer region. False on failure.
+bool makeRegionTex(const Rect& r, GLuint& tex, GLuint& fbo) {
+    while (glGetError() != GL_NO_ERROR) {}
+    glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, r.x, r.y, r.w, r.h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, r.w, r.h);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    if (glGetError() != GL_NO_ERROR) {
+        destroyTex(tex, fbo);
+        return false;
+    }
+    return true;
+}
+
+// GPU-side copy of a same-sized rect between two framebuffers (no CPU involved).
+void copyRegion(GLuint srcFbo, const Rect& src, GLuint dstFbo, const Rect& dst) {
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, srcFbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dstFbo);
+    glBlitFramebuffer(src.x, src.y, src.x + src.w, src.y + src.h, dst.x, dst.y, dst.x + dst.w, dst.y + dst.h,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
 void clearStroke() {
@@ -435,18 +459,50 @@ float sizeAt(float pressure) {
     return std::max(s, 1.0f);
 }
 
+Rect unionRect(const Rect& a, const Rect& b) {
+    int x0 = std::min(a.x, b.x), y0 = std::min(a.y, b.y);
+    int x1 = std::max(a.x + a.w, b.x + b.w), y1 = std::max(a.y + a.h, b.y + b.h);
+    return Rect{x0, y0, x1 - x0, y1 - y0};
+}
+
 void flushStamps() {
     if (gStampBuf.empty()) return;
-    float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
-    for (size_t i = 0; i + 3 < gStampBuf.size(); i += 4) {
-        float h = gStampBuf[i + 2] * 0.5f + 2.0f;
-        minX = std::min(minX, gStampBuf[i] - h);
-        minY = std::min(minY, gStampBuf[i + 1] - h);
-        maxX = std::max(maxX, gStampBuf[i] + h);
-        maxY = std::max(maxY, gStampBuf[i + 1] + h);
-    }
-    Rect dirty = clampRect(static_cast<int>(std::floor(minX)), static_cast<int>(std::floor(minY)),
+    const size_t n = gStampBuf.size() / 4;
+
+    // Dirty rects: group consecutive stamps and merge groups only while that does not waste area.
+    // (One union rect of a long diagonal batch can be hundreds of times bigger than the path itself.)
+    std::vector<Rect> dirty;
+    Rect cur;
+    bool has = false;
+    for (size_t i = 0; i < n; i += 8) {
+        const size_t j = std::min(n, i + 8);
+        float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
+        for (size_t k = i; k < j; ++k) {
+            float h = gStampBuf[k * 4 + 2] * 0.5f + 2.0f;
+            minX = std::min(minX, gStampBuf[k * 4] - h);
+            minY = std::min(minY, gStampBuf[k * 4 + 1] - h);
+            maxX = std::max(maxX, gStampBuf[k * 4] + h);
+            maxY = std::max(maxY, gStampBuf[k * 4 + 1] + h);
+        }
+        Rect g = clampRect(static_cast<int>(std::floor(minX)), static_cast<int>(std::floor(minY)),
                            static_cast<int>(std::ceil(maxX)), static_cast<int>(std::ceil(maxY)));
+        if (g.w <= 0 || g.h <= 0) continue;
+        if (!has) {
+            cur = g;
+            has = true;
+            continue;
+        }
+        Rect m = unionRect(cur, g);
+        const long long am = static_cast<long long>(m.w) * m.h;
+        const long long as = static_cast<long long>(cur.w) * cur.h + static_cast<long long>(g.w) * g.h;
+        if (am * 2 <= as * 3) {
+            cur = m;
+        } else {
+            dirty.push_back(cur);
+            cur = g;
+        }
+    }
+    if (has) dirty.push_back(cur);
 
     glBindFramebuffer(GL_FRAMEBUFFER, gStrokeFbo);
     glViewport(0, 0, gCw, gCh);
@@ -460,12 +516,12 @@ void flushStamps() {
     glBindBuffer(GL_ARRAY_BUFFER, gStampVbo);
     glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(gStampBuf.size() * sizeof(float)),
                  gStampBuf.data(), GL_STREAM_DRAW);
-    glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, static_cast<GLsizei>(gStampBuf.size() / 4));
+    glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, static_cast<GLsizei>(n));
     glBindVertexArray(0);
     glDisable(GL_BLEND);
     gStampBuf.clear();
 
-    recomposite(dirty);  // live preview of the stroke on the active layer
+    for (const Rect& r : dirty) recomposite(r);  // live preview of the stroke on the active layer
 }
 
 void stampAt(float x, float y, float pressure) {
@@ -508,14 +564,22 @@ void walk(const Pt& a, const Pt& c, const Pt& b) {
 }
 
 // ---------------------------------------------------------------- history
+void destroyEntry(HistEntry& e) { destroyTex(e.tex, e.fbo); }
+
 void trimHistory() {
     while (!gUndo.empty() && (gUndo.size() > kMaxHistoryEntries || gHistBytes > kMaxHistoryBytes)) {
         gHistBytes -= gUndo.front().bytes();
+        destroyEntry(gUndo.front());
         gUndo.pop_front();
     }
 }
 
-void clearHistory() {
+// destroy=false when the GL context is gone (its objects no longer exist).
+void clearHistory(bool destroy = true) {
+    if (destroy) {
+        for (auto& e : gUndo) destroyEntry(e);
+        for (auto& e : gRedo) destroyEntry(e);
+    }
     gUndo.clear();
     gRedo.clear();
     gHistBytes = 0;
@@ -526,6 +590,7 @@ void purgeHistory(int layerId) {
         for (auto it = q.begin(); it != q.end();) {
             if (it->layerId == layerId) {
                 gHistBytes -= it->bytes();
+                destroyEntry(*it);
                 it = q.erase(it);
             } else {
                 ++it;
@@ -555,10 +620,12 @@ void commitStroke() {
     }
     Layer& L = gLayers[idx];
 
+    // Keep the layer's current pixels of this rect for undo: GPU->GPU copy, no readback.
     HistEntry e;
     e.layerId = L.id;
-    e.x = r.x; e.y = r.y; e.w = r.w; e.h = r.h;
-    readRect(L.fbo, r, e.before);
+    e.r = r;
+    const bool haveHistory = makeRegionTex(r, e.tex, e.fbo);
+    if (haveHistory) copyRegion(L.fbo, r, e.fbo, Rect{0, 0, r.w, r.h});
 
     glBindFramebuffer(GL_FRAMEBUFFER, L.fbo);
     glViewport(0, 0, gCw, gCh);
@@ -582,32 +649,49 @@ void commitStroke() {
     glDisable(GL_BLEND);
     glDisable(GL_SCISSOR_TEST);
 
-    readRect(L.fbo, r, e.after);
-    for (auto& q : gRedo) gHistBytes -= q.bytes();
+    for (auto& q : gRedo) {
+        gHistBytes -= q.bytes();
+        destroyEntry(q);
+    }
     gRedo.clear();
-    gHistBytes += e.bytes();
-    gUndo.push_back(std::move(e));
-    trimHistory();
+    if (haveHistory) {
+        gHistBytes += e.bytes();
+        gUndo.push_back(e);
+        trimHistory();
+    }
 
     clearStroke();
     recomposite(r);
 }
 
+// Undo and redo are the same operation: swap the layer's rect with the entry's saved pixels.
 bool applyHistory(bool undo) {
     auto& from = undo ? gUndo : gRedo;
     auto& to = undo ? gRedo : gUndo;
     while (!from.empty()) {
-        HistEntry e = std::move(from.back());
+        HistEntry e = from.back();
         from.pop_back();
         int idx = findLayer(e.layerId);
         if (idx < 0) {
             gHistBytes -= e.bytes();
+            destroyEntry(e);
             continue;
         }
-        Rect r{e.x, e.y, e.w, e.h};
-        uploadRect(gLayers[idx].tex, r, undo ? e.before : e.after);
-        recomposite(r);
-        to.push_back(std::move(e));
+        Layer& L = gLayers[idx];
+        GLuint t2 = 0, f2 = 0;
+        if (!makeRegionTex(e.r, t2, f2)) {  // out of GPU memory: drop this entry
+            gHistBytes -= e.bytes();
+            destroyEntry(e);
+            return false;
+        }
+        const Rect local{0, 0, e.r.w, e.r.h};
+        copyRegion(L.fbo, e.r, f2, local);   // layer now -> temp
+        copyRegion(e.fbo, local, L.fbo, e.r);  // saved pixels -> layer
+        destroyEntry(e);
+        e.tex = t2;
+        e.fbo = f2;
+        recomposite(e.r);
+        to.push_back(e);
         return true;
     }
     return false;
@@ -629,7 +713,7 @@ void releaseCanvas() {
     for (int i = 0; i < 2; ++i) destroyTex(gAccTex[i], gAccFbo[i]);
     destroyTex(gFlatTex, gFlatFbo);
     destroyTex(gStrokeTex, gStrokeFbo);
-    clearHistory();
+    clearHistory(true);
     gStampBuf.clear();
     gStroke = false;
     gActiveId = -1;
@@ -641,7 +725,7 @@ void forgetAll() {  // new GL context: old object names are invalid, do not dele
     gLayers.clear();
     gAccTex[0] = gAccTex[1] = gAccFbo[0] = gAccFbo[1] = 0;
     gFlatTex = gFlatFbo = gStrokeTex = gStrokeFbo = 0;
-    clearHistory();
+    clearHistory(false);
     gStampBuf.clear();
     gStroke = false;
     gActiveId = -1;
@@ -716,7 +800,7 @@ Java_com_guhit_studio_engine_NativeEngine_nativeDraw(JNIEnv*, jobject, jfloat tx
     glViewport(0, 0, gWidth, gHeight);
     glDisable(GL_BLEND);
     glDisable(GL_SCISSOR_TEST);
-    glClearColor(0.11f, 0.11f, 0.12f, 1.0f);
+    glClearColor(0.02f, 0.027f, 0.05f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     if (!gDisplayProg || !gFlatTex || gCw <= 0) return;
     glUseProgram(gDisplayProg);
@@ -894,7 +978,7 @@ Java_com_guhit_studio_engine_NativeEngine_nativeLoadLayerPixels(JNIEnv* env, job
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, gCw, gCh, GL_RGBA, GL_UNSIGNED_BYTE, p);
     env->ReleaseByteArrayElements(in, p, JNI_ABORT);
-    clearHistory();
+    clearHistory(true);
     return JNI_TRUE;
 }
 
@@ -985,7 +1069,12 @@ Java_com_guhit_studio_engine_NativeEngine_nativeStrokeAdd(JNIEnv*, jobject, jflo
         gPts[0] = gPts[1];
         gPts[1] = gPts[2];
     }
-    flushStamps();
+    // Stamps are drawn by nativeStrokeFlush() (once per touch event) or when the batch is full.
+}
+
+JNIEXPORT void JNICALL
+Java_com_guhit_studio_engine_NativeEngine_nativeStrokeFlush(JNIEnv*, jobject) {
+    if (gStroke) flushStamps();
 }
 
 JNIEXPORT void JNICALL

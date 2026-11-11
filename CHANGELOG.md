@@ -1,6 +1,37 @@
 # Changelog
 Format: Keep a Changelog, SemVer.
 
+## [0.5.0] - New UI (Ibis Paint-style layout, midnight blue + gold)
+### Changed
+- Layout reorganised like Ibis Paint X: top bar (back, undo, redo, fit view, menu); size and opacity
+  sliders plus a tool row at the bottom (Brush, Eraser, Layers, Color); panels are bottom sheets.
+- Bars can be hidden with the gold handle to give the whole screen to the canvas.
+- Theme: black and midnight blue surfaces with a luxury-gold accent (including gallery, dialogs, canvas surround).
+- New original icon set (brush, eraser, layers, undo/redo, fit view, eye, ...). Visibility toggles in the
+  layer list now use eye icons.
+- Size/opacity are horizontal pill sliders with values (px and %).
+### Removed
+- Floating top bar, left vertical sliders and pop-up panels (replaced by the above).
+
+## [0.4.3] - performance: big soft brushes
+### Changed
+- Airbrush and Soft Round use wider stamp spacing with compensated flow: about half as many stamps,
+  same look. (Big soft brushes were fill-rate bound on large canvases.)
+- Stamp shader: discards pixels outside the circle and uses medium precision.
+- Live-preview redraw is limited to small dirty rects around the new stamps instead of one big union.
+### Added
+- Menu -> "Ipakita ang FPS" shows frames per second while drawing, to measure speed.
+
+## [0.4.2] - performance (large canvases, long strokes)
+### Fixed
+- Lag on large canvases that grew with stroke length:
+  - Undo no longer reads pixels back to the CPU. The stroke's previous pixels are kept in a small GPU
+    texture (GPU-to-GPU copy), so lifting the finger after a long stroke no longer stalls.
+  - Touch points are batched: one GL event and one redraw per touch event instead of one per point.
+- (includes 0.4.1: icon, fixed signing key, readable text in panels)
+### Changed
+- Undo history is now stored in GPU memory (up to 256 MB, oldest entries dropped first).
+
 ## [0.4.1]
 ### Added
 - App icon (adaptive + Android 13 themed icon) from the supplied brush artwork. Source and generator:

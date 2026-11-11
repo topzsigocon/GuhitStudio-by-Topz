@@ -38,6 +38,9 @@ object NativeEngine {
 
     external fun nativeStrokeBegin()
     external fun nativeStrokeAdd(x: Float, y: Float, pressure: Float)
+
+    /** Draws the stamps queued by nativeStrokeAdd (call once per touch event, not per point). */
+    external fun nativeStrokeFlush()
     external fun nativeStrokeEnd()
     external fun nativeStrokeCancel()
 
