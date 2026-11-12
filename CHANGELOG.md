@@ -1,6 +1,20 @@
 # Changelog
 Format: Keep a Changelog, SemVer.
 
+## [0.6.0] - Fill, pipette, recent colors, layer thumbnails
+### Added
+- Fill tool ("Pampuno"): tap to flood-fill the active layer. The left slider becomes Tolerance.
+  Menu switch: decide the shape from all layers (default, best for filling under line art on its own
+  layer) or from the active layer only. Fill is undoable and respects alpha lock / opacity.
+- Pipette tool ("Pipeta"): touch and drag to pick a color from the flattened picture; the color updates
+  live and the previous tool returns when you lift your finger.
+- Recent colors row in the color panel (remembered between sessions).
+- Layer thumbnails in the layer list (updated shortly after you draw or change layers).
+- Engine: GPU layer previews, pixel sampling, scanline flood fill.
+- Tool row: Brush, Eraser, Pipette, Fill, Layers, Color.
+### Known gaps
+- Fill edges are not anti-aliased (a 1 px grow hides most halos). Layer operations are still not undoable.
+
 ## [0.5.0] - New UI (Ibis Paint-style layout, midnight blue + gold)
 ### Changed
 - Layout reorganised like Ibis Paint X: top bar (back, undo, redo, fit view, menu); size and opacity

@@ -1,12 +1,20 @@
 package com.guhit.studio
 
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -30,7 +38,12 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.painterResource
@@ -47,6 +60,8 @@ import kotlin.math.roundToInt
 fun LayersPanel(
     layers: List<Layer>,
     activeId: Int,
+    thumbs: Map<Int, ImageBitmap>,
+    aspect: Float,
     maxLayers: Int,
     onSelect: (Int) -> Unit,
     onAdd: () -> Unit,
@@ -96,6 +111,8 @@ fun LayersPanel(
                         tint = if (l.visible) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
+                LayerThumb(thumbs[l.id], aspect, l.visible)
+                Spacer(Modifier.width(10.dp))
                 Column(Modifier.weight(1f).padding(vertical = 4.dp)) {
                     Text(
                         l.name,
@@ -126,7 +143,7 @@ fun LayersPanel(
                 modifier = Modifier.padding(horizontal = 6.dp),
             )
 
-            Box2 {
+            Box {
                 TextButton(onClick = { blendMenu = true }) {
                     Text(stringResource(R.string.layer_blend, sel.blend.label))
                 }
@@ -218,6 +235,43 @@ fun LayersPanel(
     }
 }
 
+/** Small preview of a layer on a checkerboard. Dimmed when the layer is hidden. */
+@Composable
+private fun LayerThumb(bitmap: ImageBitmap?, aspect: Float, visible: Boolean) {
+    val shape = RoundedCornerShape(6.dp)
+    Box(
+        Modifier
+            .size(46.dp)
+            .clip(shape)
+            .border(1.dp, MaterialTheme.colorScheme.outline, shape)
+            .alpha(if (visible) 1f else 0.45f),
+        contentAlignment = Alignment.Center,
+    ) {
+        Canvas(Modifier.fillMaxSize()) {
+            val cell = 6.dp.toPx()
+            val cols = (size.width / cell).toInt() + 1
+            val rows = (size.height / cell).toInt() + 1
+            for (r in 0 until rows) {
+                for (c in 0 until cols) {
+                    drawRect(
+                        color = if ((r + c) % 2 == 0) Color(0xFFFFFFFF) else Color(0xFFD9D9D9),
+                        topLeft = Offset(c * cell, r * cell),
+                        size = Size(cell, cell),
+                    )
+                }
+            }
+        }
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap,
+                contentDescription = null,
+                contentScale = ContentScale.Fit,
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
+    }
+}
+
 @Composable
 private fun layerTags(l: Layer): String {
     val parts = ArrayList<String>()
@@ -241,8 +295,3 @@ private fun SwitchRow(label: String, checked: Boolean, onChecked: (Boolean) -> U
     }
 }
 
-/** Box without importing foundation's Box just to anchor a DropdownMenu. */
-@Composable
-private fun Box2(content: @Composable () -> Unit) {
-    androidx.compose.foundation.layout.Box { content() }
-}

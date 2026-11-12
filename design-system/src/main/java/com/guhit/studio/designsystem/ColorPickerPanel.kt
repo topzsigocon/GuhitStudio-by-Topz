@@ -49,6 +49,7 @@ fun ColorPickerPanel(
     color: Color,
     onColorChange: (Color) -> Unit,
     modifier: Modifier = Modifier,
+    recent: List<Color> = emptyList(),
 ) {
     val init = remember { hsvOf(color) }
     var hue by remember { mutableFloatStateOf(init[0]) }
@@ -134,6 +135,31 @@ fun ColorPickerPanel(
                 text = "#%06X".format(color.toArgb() and 0xFFFFFF),
                 style = MaterialTheme.typography.labelLarge,
             )
+        }
+
+        // Recently used colors
+        if (recent.isNotEmpty()) {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("Mga huling kulay", style = MaterialTheme.typography.labelMedium)
+                recent.chunked(6).forEach { rowColors ->
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        rowColors.forEach { rc ->
+                            Box(
+                                Modifier
+                                    .size(32.dp)
+                                    .clip(CircleShape)
+                                    .background(rc)
+                                    .border(1.dp, GuhitColors.Gold.copy(alpha = 0.5f), CircleShape)
+                                    .clickable {
+                                        val a = hsvOf(rc)
+                                        hue = a[0]; sat = a[1]; value = a[2]
+                                        onChange(rc)
+                                    },
+                            )
+                        }
+                    }
+                }
+            }
         }
 
         // Swatches

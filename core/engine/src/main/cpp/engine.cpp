@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <utility>
 #include <vector>
@@ -607,17 +608,9 @@ bool strokeRect(Rect& out) {
     return out.w > 0 && out.h > 0;
 }
 
-void commitStroke() {
-    flushStamps();
-    Rect r;
-    int idx = findLayer(gStrokeLayer);
-    bool ok = idx >= 0 && strokeRect(r);
-    gStroke = false;
-    if (!ok) {
-        clearStroke();
-        recomposite(fullRect());
-        return;
-    }
+// Blends the stroke buffer (premultiplied, scaled by gBrush.opacity) into layer `idx` inside rect r,
+// keeping the previous pixels for undo. Used by strokes and by fill.
+void commitRegion(int idx, const Rect& r) {
     Layer& L = gLayers[idx];
 
     // Keep the layer's current pixels of this rect for undo: GPU->GPU copy, no readback.
@@ -662,6 +655,20 @@ void commitStroke() {
 
     clearStroke();
     recomposite(r);
+}
+
+void commitStroke() {
+    flushStamps();
+    Rect r;
+    int idx = findLayer(gStrokeLayer);
+    bool ok = idx >= 0 && strokeRect(r);
+    gStroke = false;
+    if (!ok) {
+        clearStroke();
+        recomposite(fullRect());
+        return;
+    }
+    commitRegion(idx, r);
 }
 
 // Undo and redo are the same operation: swap the layer's rect with the entry's saved pixels.
@@ -1009,6 +1016,149 @@ Java_com_guhit_studio_engine_NativeEngine_nativeReadFlat(JNIEnv* env, jobject, j
     std::vector<uint8_t> buf;
     readRect(gFlatFbo, fullRect(), buf);
     env->SetByteArrayRegion(out, 0, need, reinterpret_cast<const jbyte*>(buf.data()));
+    return JNI_TRUE;
+}
+
+// Color of the flattened picture at (x, y) over white paper, as 0xAARRGGBB. 0 if outside the canvas.
+JNIEXPORT jint JNICALL
+Java_com_guhit_studio_engine_NativeEngine_nativeSamplePixel(JNIEnv*, jobject, jint x, jint y) {
+    if (!gFlatFbo || x < 0 || y < 0 || x >= gCw || y >= gCh) return 0;
+    uint8_t px[4] = {255, 255, 255, 255};
+    glBindFramebuffer(GL_FRAMEBUFFER, gFlatFbo);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    const int back = 255 - px[3];  // premultiplied over white
+    const int r = std::min(255, px[0] + back), g = std::min(255, px[1] + back), b = std::min(255, px[2] + back);
+    return static_cast<jint>((0xFFu << 24) | (static_cast<uint32_t>(r) << 16) | (static_cast<uint32_t>(g) << 8) |
+                             static_cast<uint32_t>(b));
+}
+
+// Flood fill from (sx, sy) on the active layer. The region is decided on the flattened picture
+// (sampleMerged) or on the active layer alone, grown by `expand` px to hide anti-aliased halos.
+JNIEXPORT jboolean JNICALL
+Java_com_guhit_studio_engine_NativeEngine_nativeFill(JNIEnv*, jobject, jint sx, jint sy, jfloat cr, jfloat cg,
+                                                     jfloat cb, jfloat opacity, jfloat tolerance, jint expand,
+                                                     jboolean sampleMerged) {
+    if (gStroke || gCw <= 0) return JNI_FALSE;
+    const int li = findLayer(gActiveId);
+    if (li < 0 || sx < 0 || sy < 0 || sx >= gCw || sy >= gCh) return JNI_FALSE;
+    const int w = gCw, h = gCh;
+
+    std::vector<uint8_t> src;
+    readRect(sampleMerged == JNI_TRUE ? gFlatFbo : gLayers[li].fbo, fullRect(), src);
+
+    const int thr = std::clamp(static_cast<int>(tolerance * 255.0f + 0.5f), 0, 255);
+    const size_t seedAt = (static_cast<size_t>(sy) * w + sx) * 4;
+    const int s0 = src[seedAt], s1 = src[seedAt + 1], s2 = src[seedAt + 2], s3 = src[seedAt + 3];
+    auto match = [&](int x, int y) {
+        const uint8_t* p = &src[(static_cast<size_t>(y) * w + x) * 4];
+        return std::abs(static_cast<int>(p[0]) - s0) <= thr && std::abs(static_cast<int>(p[1]) - s1) <= thr &&
+               std::abs(static_cast<int>(p[2]) - s2) <= thr && std::abs(static_cast<int>(p[3]) - s3) <= thr;
+    };
+
+    std::vector<uint8_t> mask(static_cast<size_t>(w) * h, 0);
+    std::vector<std::pair<int, int>> stack;
+    stack.emplace_back(sx, sy);
+    int minX = sx, maxX = sx, minY = sy, maxY = sy;
+    while (!stack.empty()) {
+        const auto [px, py] = stack.back();
+        stack.pop_back();
+        const size_t row = static_cast<size_t>(py) * w;
+        if (mask[row + px] || !match(px, py)) continue;
+        int l = px, r = px;
+        while (l > 0 && !mask[row + l - 1] && match(l - 1, py)) --l;
+        while (r < w - 1 && !mask[row + r + 1] && match(r + 1, py)) ++r;
+        for (int i = l; i <= r; ++i) mask[row + i] = 1;
+        minX = std::min(minX, l);
+        maxX = std::max(maxX, r);
+        minY = std::min(minY, py);
+        maxY = std::max(maxY, py);
+        for (int dy = -1; dy <= 1; dy += 2) {
+            const int ny = py + dy;
+            if (ny < 0 || ny >= h) continue;
+            const size_t nrow = static_cast<size_t>(ny) * w;
+            bool inSpan = false;
+            for (int i = l; i <= r; ++i) {
+                const bool ok = !mask[nrow + i] && match(i, ny);
+                if (ok && !inSpan) {
+                    stack.emplace_back(i, ny);
+                    inSpan = true;
+                } else if (!ok) {
+                    inSpan = false;
+                }
+            }
+        }
+    }
+
+    // Grow the region by `expand` px (4-neighbourhood) so anti-aliased edges are covered.
+    for (int k = 0; k < std::clamp(static_cast<int>(expand), 0, 8); ++k) {
+        std::vector<uint8_t> grown = mask;
+        const int y0 = std::max(0, minY - 1), y1 = std::min(h - 1, maxY + 1);
+        const int x0 = std::max(0, minX - 1), x1 = std::min(w - 1, maxX + 1);
+        for (int y = y0; y <= y1; ++y) {
+            for (int x = x0; x <= x1; ++x) {
+                const size_t i = static_cast<size_t>(y) * w + x;
+                if (mask[i]) continue;
+                if ((x > 0 && mask[i - 1]) || (x < w - 1 && mask[i + 1]) || (y > 0 && mask[i - w]) ||
+                    (y < h - 1 && mask[i + w])) {
+                    grown[i] = 1;
+                }
+            }
+        }
+        mask.swap(grown);
+        minX = x0; maxX = x1; minY = y0; maxY = y1;
+    }
+
+    const Rect r{minX, minY, maxX - minX + 1, maxY - minY + 1};
+    std::vector<uint8_t> up(static_cast<size_t>(r.w) * r.h * 4, 0);
+    const uint8_t cr8 = static_cast<uint8_t>(std::clamp(cr, 0.0f, 1.0f) * 255.0f + 0.5f);
+    const uint8_t cg8 = static_cast<uint8_t>(std::clamp(cg, 0.0f, 1.0f) * 255.0f + 0.5f);
+    const uint8_t cb8 = static_cast<uint8_t>(std::clamp(cb, 0.0f, 1.0f) * 255.0f + 0.5f);
+    for (int y = 0; y < r.h; ++y) {
+        const size_t mrow = static_cast<size_t>(r.y + y) * w + r.x;
+        uint8_t* out = &up[static_cast<size_t>(y) * r.w * 4];
+        for (int x = 0; x < r.w; ++x) {
+            if (mask[mrow + x]) {
+                out[x * 4] = cr8;
+                out[x * 4 + 1] = cg8;
+                out[x * 4 + 2] = cb8;
+                out[x * 4 + 3] = 255;
+            }
+        }
+    }
+    clearStroke();
+    glBindTexture(GL_TEXTURE_2D, gStrokeTex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, r.x, r.y, r.w, r.h, GL_RGBA, GL_UNSIGNED_BYTE, up.data());
+
+    const Brush saved = gBrush;
+    gBrush.opacity = std::clamp(static_cast<float>(opacity), 0.0f, 1.0f);
+    gBrush.erase = false;
+    commitRegion(li, r);
+    gBrush = saved;
+    return JNI_TRUE;
+}
+
+// Small preview (tw x th, premultiplied RGBA, row 0 = top) of one layer, scaled on the GPU.
+JNIEXPORT jboolean JNICALL
+Java_com_guhit_studio_engine_NativeEngine_nativeLayerThumb(JNIEnv* env, jobject, jint id, jint tw, jint th,
+                                                           jbyteArray out) {
+    const int i = findLayer(id);
+    if (i < 0 || gCw <= 0 || tw <= 0 || th <= 0) return JNI_FALSE;
+    if (env->GetArrayLength(out) < tw * th * 4) return JNI_FALSE;
+    GLuint t = 0, f = 0;
+    const Rect tr{0, 0, tw, th};
+    if (!makeRegionTex(tr, t, f)) return JNI_FALSE;
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, gLayers[i].fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, f);
+    glBlitFramebuffer(0, 0, gCw, gCh, 0, 0, tw, th, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    std::vector<uint8_t> buf;
+    readRect(f, tr, buf);
+    destroyTex(t, f);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    env->SetByteArrayRegion(out, 0, tw * th * 4, reinterpret_cast<const jbyte*>(buf.data()));
     return JNI_TRUE;
 }
 

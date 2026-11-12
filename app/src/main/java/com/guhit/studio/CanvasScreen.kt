@@ -1,6 +1,7 @@
 package com.guhit.studio
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
@@ -54,6 +55,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
@@ -74,8 +77,11 @@ import com.guhit.studio.designsystem.ValueSlider
 import com.guhit.studio.engine.BrushMath
 import com.guhit.studio.engine.BrushPresets
 import com.guhit.studio.engine.CanvasSurfaceView
+import com.guhit.studio.engine.CanvasTool
+import com.guhit.studio.engine.ColorHistory
 import com.guhit.studio.engine.FingerMode
 import com.guhit.studio.engine.Layer
+import java.nio.ByteBuffer
 import java.util.Locale
 import java.util.concurrent.Executors
 import kotlin.math.roundToInt
@@ -309,6 +315,32 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
     var fps by remember { mutableFloatStateOf(0f) }
     var undoCount by remember { mutableIntStateOf(0) }
     var redoCount by remember { mutableIntStateOf(0) }
+    var tool by remember { mutableStateOf(CanvasTool.DRAW) }
+    var prevTool by remember { mutableStateOf(CanvasTool.DRAW) } // tool to return to after the pipette
+    var tolerance by remember { mutableFloatStateOf(0.1f) }
+    var fillMerged by remember { mutableStateOf(true) }
+    val prefs = remember { context.getSharedPreferences("guhit", Context.MODE_PRIVATE) }
+    var recent by remember { mutableStateOf(ColorHistory.decode(prefs.getString("recent_colors", null))) }
+    var thumbs by remember { mutableStateOf<Map<Int, ImageBitmap>>(emptyMap()) }
+    val colorHolder = remember { arrayOf(Color.Black) }
+    val panelHolder = remember { arrayOf(Panel.None) }
+
+    fun refreshThumbs() {
+        canvas.requestThumbnails(72) { w, h, map ->
+            val out = HashMap<Int, ImageBitmap>()
+            for ((id, bytes) in map) {
+                val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                bmp.copyPixelsFromBuffer(ByteBuffer.wrap(bytes))
+                out[id] = bmp.asImageBitmap()
+            }
+            thumbs = out
+        }
+    }
+    val thumbTask = remember { Runnable { refreshThumbs() } }
+    fun scheduleThumbs() {
+        main.removeCallbacks(thumbTask)
+        main.postDelayed(thumbTask, 350)
+    }
 
     val preset = BrushPresets.all.first { it.id == presetId }
     val sizePx = BrushMath.sizeFromSlider(sizeValue)
@@ -318,11 +350,22 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
     // (Reading them only inside the panels would recompose just the panels and leave the engine stale.)
     val brushSettings = preset.toSettings(sizePx, opacity, color.toArgb(), erase)
     val fingerMode = if (fingerDraws) FingerMode.DRAW else FingerMode.NAVIGATE
+    val toolNow = tool
+    val toleranceNow = tolerance
+    val mergedNow = fillMerged
+    val colorNow = color
+    val panelNow = panel
     SideEffect {
         canvas.brush = brushSettings
         canvas.fingerMode = fingerMode
         canvas.fpsEnabled = showFps
+        canvas.tool = toolNow
+        canvas.fillTolerance = toleranceNow
+        canvas.fillSampleMerged = mergedNow
+        colorHolder[0] = colorNow
+        panelHolder[0] = panelNow
     }
+    LaunchedEffect(panelNow, layers) { if (panelNow == Panel.Layers) scheduleThumbs() }
 
     // GL lifecycle + callbacks from the engine.
     DisposableEffect(canvas, saver) {
@@ -347,7 +390,16 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
             Toast.makeText(context, R.string.stylus_detected, Toast.LENGTH_LONG).show()
         }
         canvas.onFps = { fps = it }
-        canvas.onContentChanged = { saver.markDirty() }
+        canvas.onContentChanged = {
+            saver.markDirty()
+            recent = ColorHistory.push(recent, colorHolder[0].toArgb())
+            prefs.edit().putString("recent_colors", ColorHistory.encode(recent)).apply()
+            if (panelHolder[0] == Panel.Layers) scheduleThumbs()
+        }
+        canvas.onColorSampled = { c, final ->
+            color = Color(c)
+            if (final) tool = prevTool
+        }
         canvas.onLayersChanged = { l, a ->
             layers = l
             activeLayerId = a
@@ -378,6 +430,7 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
             canvas.onHistoryChanged = null
             canvas.onStylusDetected = null
             canvas.onContentChanged = null
+            canvas.onColorSampled = null
             canvas.onFps = null
             canvas.onLayersChanged = null
             canvas.onDocumentReady = null
@@ -500,10 +553,16 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
                             presetId = it
                             panel = Panel.None
                         }
-                        Panel.Color -> ColorPickerPanel(color = color, onColorChange = { color = it })
+                        Panel.Color -> ColorPickerPanel(
+                            color = color,
+                            onColorChange = { color = it },
+                            recent = recent.map { Color(it) },
+                        )
                         Panel.Layers -> LayersPanel(
                             layers = layers,
                             activeId = activeLayerId,
+                            thumbs = thumbs,
+                            aspect = artwork.width.toFloat() / artwork.height,
                             maxLayers = canvas.maxLayers,
                             onSelect = canvas::selectLayer,
                             onAdd = { canvas.addLayer() },
@@ -518,6 +577,8 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
                             onFingerDraws = { fingerDraws = it },
                             showFps = showFps,
                             onShowFps = { showFps = it },
+                            fillMerged = fillMerged,
+                            onFillMerged = { fillMerged = it },
                             onResetView = {
                                 canvas.resetView()
                                 panel = Panel.None
@@ -544,13 +605,23 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
                             .padding(horizontal = 12.dp, vertical = 8.dp),
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
-                        ValueSlider(
-                            label = stringResource(R.string.label_size),
-                            valueText = "${sizePx.roundToInt()} px",
-                            value = sizeValue,
-                            onValueChange = { sizeValue = it },
-                            modifier = Modifier.weight(1f),
-                        )
+                        if (tool == CanvasTool.FILL) {
+                            ValueSlider(
+                                label = stringResource(R.string.label_tolerance),
+                                valueText = "${(tolerance * 100).roundToInt()}%",
+                                value = tolerance,
+                                onValueChange = { tolerance = it },
+                                modifier = Modifier.weight(1f),
+                            )
+                        } else {
+                            ValueSlider(
+                                label = stringResource(R.string.label_size),
+                                valueText = "${sizePx.roundToInt()} px",
+                                value = sizeValue,
+                                onValueChange = { sizeValue = it },
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
                         ValueSlider(
                             label = stringResource(R.string.label_opacity),
                             valueText = "${(opacity * 100).roundToInt()}%",
@@ -562,14 +633,47 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
                     BottomToolbar {
                         ToolbarButton(
                             label = stringResource(R.string.tool_brush),
-                            selected = panel == Panel.Brushes,
-                            onClick = { toggle(Panel.Brushes) },
+                            selected = tool == CanvasTool.DRAW && !erase,
+                            onClick = {
+                                if (tool == CanvasTool.DRAW && !erase) {
+                                    toggle(Panel.Brushes) // already the brush: open the brush list
+                                } else {
+                                    tool = CanvasTool.DRAW
+                                    erase = false
+                                    panel = Panel.None
+                                }
+                            },
                         ) { tint -> Icon(painterResource(R.drawable.ic_brush), null, tint = tint) }
                         ToolbarButton(
                             label = stringResource(R.string.tool_eraser),
-                            selected = erase,
-                            onClick = { erase = !erase },
+                            selected = tool == CanvasTool.DRAW && erase,
+                            onClick = {
+                                tool = CanvasTool.DRAW
+                                erase = true
+                                panel = Panel.None
+                            },
                         ) { tint -> Icon(painterResource(R.drawable.ic_eraser), null, tint = tint) }
+                        ToolbarButton(
+                            label = stringResource(R.string.tool_pipette),
+                            selected = tool == CanvasTool.EYEDROPPER,
+                            onClick = {
+                                if (tool == CanvasTool.EYEDROPPER) {
+                                    tool = prevTool
+                                } else {
+                                    prevTool = tool
+                                    tool = CanvasTool.EYEDROPPER
+                                }
+                                panel = Panel.None
+                            },
+                        ) { tint -> Icon(painterResource(R.drawable.ic_pipette), null, tint = tint) }
+                        ToolbarButton(
+                            label = stringResource(R.string.tool_fill),
+                            selected = tool == CanvasTool.FILL,
+                            onClick = {
+                                tool = CanvasTool.FILL
+                                panel = Panel.None
+                            },
+                        ) { tint -> Icon(painterResource(R.drawable.ic_fill), null, tint = tint) }
                         ToolbarButton(
                             label = stringResource(R.string.layers_btn, layers.size),
                             selected = panel == Panel.Layers,
@@ -651,6 +755,8 @@ private fun ActionsList(
     onFingerDraws: (Boolean) -> Unit,
     showFps: Boolean,
     onShowFps: (Boolean) -> Unit,
+    fillMerged: Boolean,
+    onFillMerged: (Boolean) -> Unit,
     onResetView: () -> Unit,
     onExportPng: () -> Unit,
     onExportPngWhite: () -> Unit,
@@ -674,6 +780,17 @@ private fun ActionsList(
     ) {
         Text(stringResource(R.string.show_fps), fontWeight = FontWeight.Medium)
         Switch(checked = showFps, onCheckedChange = onShowFps)
+    }
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(stringResource(R.string.fill_merged), fontWeight = FontWeight.Medium)
+            Text(stringResource(R.string.fill_merged_hint), style = MaterialTheme.typography.bodySmall)
+        }
+        Switch(checked = fillMerged, onCheckedChange = onFillMerged)
     }
     ActionRow(stringResource(R.string.reset_view), onResetView)
     ActionRow(stringResource(R.string.export_png), onExportPng)

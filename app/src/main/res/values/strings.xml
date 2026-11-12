@@ -55,4 +55,10 @@
     <string name="undo_desc">I-undo</string>
     <string name="redo_desc">I-redo</string>
     <string name="menu_desc">Menu</string>
+    <string name="tool_pipette">Pipeta</string>
+    <string name="tool_fill">Pampuno</string>
+    <string name="label_tolerance">Tolerance</string>
+    <string name="fill_merged">Pampuno: batay sa lahat ng layer</string>
+    <string name="fill_merged_hint">Naka-on: sinusunod ang hugis mula sa lahat ng layer. Naka-off: sa napiling layer lang.</string>
+    <string name="recent_colors">Mga huling kulay</string>
 </resources>

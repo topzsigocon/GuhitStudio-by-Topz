@@ -37,6 +37,20 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
     var fingerMode: FingerMode = FingerMode.DRAW
 
     var autoSwitchOnStylus = true
+
+    /** What a touch does: draw/erase, pick a color, or flood fill. */
+    @Volatile
+    var tool: CanvasTool = CanvasTool.DRAW
+
+    /** Fill: 0..1 color distance allowed, and whether the region is decided on all layers or only the active one. */
+    @Volatile
+    var fillTolerance = 0.1f
+
+    @Volatile
+    var fillSampleMerged = true
+
+    /** Eyedropper result (UI thread). [final] = finger lifted. */
+    var onColorSampled: ((color: Int, final: Boolean) -> Unit)? = null
     var onHistoryChanged: ((undo: Int, redo: Int) -> Unit)? = null
     var onStylusDetected: (() -> Unit)? = null
 
@@ -87,6 +101,8 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
     /** Tried to add a layer beyond [maxLayers]. */
     var onLayerLimit: (() -> Unit)? = null
     private var blockedTouch = false
+    private var tapX = 0f
+    private var tapY = 0f
 
     private val lock = Any()
     private var pendingDoc: DocState? = null
@@ -117,7 +133,7 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
     private var prevAngle = 0f
 
     // ---- touch state machine ----
-    private enum class Mode { IDLE, PENDING, DRAWING, NAVIGATING }
+    private enum class Mode { IDLE, PENDING, DRAWING, NAVIGATING, PICKING, TAP }
 
     private class RawPt(val x: Float, val y: Float, val pressure: Float, val time: Long)
 
@@ -458,6 +474,11 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
             mode = Mode.IDLE
             return
         }
+        if (tool == CanvasTool.EYEDROPPER) {
+            beginSimpleGesture(e, Mode.PICKING)
+            samplePoint(e.getX(0), e.getY(0), false)
+            return
+        }
         val activeLayer = stack.active
         blockedTouch = activeLayer == null || activeLayer.locked || !activeLayer.visible
         if (blockedTouch) {
@@ -470,6 +491,12 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
             gestureStart = e.eventTime
             recordDown(e)
             mode = Mode.NAVIGATING
+            return
+        }
+        if (tool == CanvasTool.FILL) {
+            beginSimpleGesture(e, Mode.TAP)
+            tapX = e.getX(0)
+            tapY = e.getY(0)
             return
         }
         ui.removeCallbacks(flush)
@@ -517,6 +544,7 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
                 cancelStroke()
                 mode = Mode.NAVIGATING
             }
+            Mode.PICKING, Mode.TAP -> mode = Mode.NAVIGATING
             else -> Unit
         }
     }
@@ -544,7 +572,8 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
                 e.pointerCount >= 2 -> handleTwoFingers(e)
                 fingerMode == FingerMode.NAVIGATE && maxPointers == 1 -> panSingle(e)
             }
-            Mode.IDLE -> Unit
+            Mode.PICKING -> if (e.pointerCount == 1) samplePoint(e.getX(0), e.getY(0), false)
+            Mode.TAP, Mode.IDLE -> Unit
         }
     }
 
@@ -577,11 +606,76 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
                     }
                 }
             }
+            Mode.PICKING -> if (!cancel) samplePoint(e.getX(0), e.getY(0), true)
+            Mode.TAP -> {
+                if (!cancel && e.actionMasked == MotionEvent.ACTION_UP && travel < TAP_SLOP_PX && maxPointers == 1) {
+                    fillAt(tapX, tapY)
+                }
+            }
             Mode.IDLE -> Unit
         }
         mode = Mode.IDLE
         tracking = false
         strokePointerId = -1
+    }
+
+    private fun beginSimpleGesture(e: MotionEvent, m: Mode) {
+        ui.removeCallbacks(flush)
+        pending.clear()
+        tracking = false
+        maxPointers = 1
+        travel = 0f
+        gestureStart = e.eventTime
+        recordDown(e)
+        mode = m
+    }
+
+    private fun samplePoint(sx: Float, sy: Float, final: Boolean) {
+        toCanvas(sx, sy)
+        val x = Math.floor(outX.toDouble()).toInt()
+        val y = Math.floor(outY.toDouble()).toInt()
+        gl {
+            val c = NativeEngine.nativeSamplePixel(x, y)
+            if (c != 0) ui.post { onColorSampled?.invoke(c, final) }
+        }
+    }
+
+    private fun fillAt(sx: Float, sy: Float) {
+        toCanvas(sx, sy)
+        val x = Math.floor(outX.toDouble()).toInt()
+        val y = Math.floor(outY.toDouble()).toInt()
+        val b = brush
+        val tol = fillTolerance
+        val merged = fillSampleMerged
+        gl {
+            val ok = NativeEngine.nativeFill(
+                x, y,
+                Color.red(b.color) / 255f, Color.green(b.color) / 255f, Color.blue(b.color) / 255f,
+                b.opacity, tol, FILL_EXPAND_PX, merged,
+            )
+            reportHistory(ok)
+        }
+    }
+
+    /**
+     * Small previews of every layer (longest side = [maxSide] px). The callback runs on the UI thread
+     * with the thumbnail size and premultiplied RGBA bytes per layer id.
+     */
+    fun requestThumbnails(maxSide: Int, onDone: (width: Int, height: Int, thumbs: Map<Int, ByteArray>) -> Unit) {
+        val ids = stack.layers.map { it.id }
+        val scale = maxSide.toFloat() / max(canvasW, canvasH)
+        val tw = max(1, (canvasW * scale + 0.5f).toInt())
+        val th = max(1, (canvasH * scale + 0.5f).toInt())
+        gl {
+            val map = HashMap<Int, ByteArray>()
+            if (contentValid) {
+                for (id in ids) {
+                    val b = ByteArray(tw * th * 4)
+                    if (NativeEngine.nativeLayerThumb(id, tw, th, b)) map[id] = b
+                }
+            }
+            ui.post { onDone(tw, th, map) }
+        }
     }
 
     // ---------------------------------------------------------------- drawing
@@ -755,6 +849,7 @@ class CanvasSurfaceView(context: Context) : GLSurfaceView(context) {
         const val MIN_SCALE = 0.05f
         const val MAX_SCALE = 64f
         const val ARBITRATION_MS = 40L
+        const val FILL_EXPAND_PX = 1
         const val TAP_MS = 300L
         const val TAP_SLOP_PX = 30f
     }

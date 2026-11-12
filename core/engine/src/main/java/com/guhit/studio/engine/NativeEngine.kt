@@ -30,6 +30,18 @@ object NativeEngine {
     external fun nativeReadLayerPixels(id: Int, out: ByteArray): Boolean
     external fun nativeReadFlat(out: ByteArray): Boolean
 
+    /** Color of the flattened picture at canvas pixel (x, y) over white, 0xAARRGGBB; 0 if outside. */
+    external fun nativeSamplePixel(x: Int, y: Int): Int
+
+    /** Flood fill on the active layer. Returns false if nothing was filled. */
+    external fun nativeFill(
+        x: Int, y: Int, r: Float, g: Float, b: Float, opacity: Float, tolerance: Float, expand: Int,
+        sampleMerged: Boolean,
+    ): Boolean
+
+    /** Layer preview (premultiplied RGBA, tw*th*4 bytes). */
+    external fun nativeLayerThumb(id: Int, tw: Int, th: Int, out: ByteArray): Boolean
+
     external fun nativeSetBrush(
         size: Float, hardness: Float, spacing: Float, flow: Float,
         sizePressure: Float, flowPressure: Float,
