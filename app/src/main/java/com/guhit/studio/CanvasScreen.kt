@@ -306,6 +306,12 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
     var sideVisible by remember { mutableStateOf(true) }
 
     var presetId by remember { mutableStateOf(BrushPresets.all.first().id) }
+    var hardness by remember { mutableFloatStateOf(BrushPresets.all.first().hardness) }
+    var spacing by remember { mutableFloatStateOf(BrushPresets.all.first().spacing) }
+    var flow by remember { mutableFloatStateOf(BrushPresets.all.first().flow) }
+    var sizePressure by remember { mutableFloatStateOf(BrushPresets.all.first().sizePressure) }
+    var flowPressure by remember { mutableFloatStateOf(BrushPresets.all.first().flowPressure) }
+    var streamline by remember { mutableFloatStateOf(BrushPresets.all.first().streamline) }
     var sizeValue by remember { mutableFloatStateOf(0.45f) }
     var opacity by remember { mutableFloatStateOf(1f) }
     var color by remember { mutableStateOf(Color.Black) }
@@ -342,7 +348,10 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
         main.postDelayed(thumbTask, 350)
     }
 
-    val preset = BrushPresets.all.first { it.id == presetId }
+    val preset = BrushPresets.byId(presetId).copy(
+        hardness = hardness, spacing = spacing, flow = flow,
+        sizePressure = sizePressure, flowPressure = flowPressure, streamline = streamline
+    )
     val sizePx = BrushMath.sizeFromSlider(sizeValue)
 
     // Read EVERY brush-related state here, in the screen's own scope, so any change (size, opacity,
@@ -549,10 +558,22 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
             ) {
                 BottomSheetPanel(scroll = panel != Panel.Layers) {
                     when (panel) {
-                        Panel.Brushes -> BrushList(selectedId = presetId) {
-                            presetId = it
-                            panel = Panel.None
-                        }
+                        Panel.Brushes -> BrushList(
+                            selectedId = presetId,
+                            hardness = hardness, spacing = spacing, flow = flow,
+                            sizePressure = sizePressure, flowPressure = flowPressure,
+                            streamline = streamline,
+                            onSelect = { id ->
+                                val p = BrushPresets.byId(id)
+                                presetId = id
+                                hardness = p.hardness; spacing = p.spacing; flow = p.flow
+                                sizePressure = p.sizePressure; flowPressure = p.flowPressure
+                                streamline = p.streamline
+                            },
+                            onHardness = { hardness = it }, onSpacing = { spacing = it },
+                            onFlow = { flow = it }, onSizePressure = { sizePressure = it },
+                            onFlowPressure = { flowPressure = it }, onStreamline = { streamline = it },
+                        )
                         Panel.Color -> ColorPickerPanel(
                             color = color,
                             onColorChange = { color = it },
@@ -732,21 +753,49 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
 }
 
 @Composable
-private fun BrushList(selectedId: String, onSelect: (String) -> Unit) {
-    BrushPresets.all.forEach { p ->
-        val selected = p.id == selectedId
-        Column(
-            Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(10.dp))
-                .background(if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f) else Color.Transparent)
-                .clickable { onSelect(p.id) }
-                .padding(horizontal = 10.dp, vertical = 8.dp),
-        ) {
-            Text(p.name, fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium)
-            Text(p.description, style = MaterialTheme.typography.bodySmall)
+private fun BrushList(
+    selectedId: String,
+    hardness: Float, spacing: Float, flow: Float,
+    sizePressure: Float, flowPressure: Float, streamline: Float,
+    onSelect: (String) -> Unit,
+    onHardness: (Float) -> Unit, onSpacing: (Float) -> Unit,
+    onFlow: (Float) -> Unit, onSizePressure: (Float) -> Unit,
+    onFlowPressure: (Float) -> Unit, onStreamline: (Float) -> Unit,
+) {
+    Text("BRUSH LIBRARY · ${BrushPresets.all.size} PRESETS", fontWeight = FontWeight.Bold)
+    BrushPresets.all.groupBy { it.category }.forEach { (category, presets) ->
+        Text(category.uppercase(Locale.getDefault()), color = MaterialTheme.colorScheme.primary,
+            style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(top = 8.dp))
+        presets.forEach { p ->
+            val selected = p.id == selectedId
+            Column(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+                    .background(if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f) else Color.Transparent)
+                    .clickable { onSelect(p.id) }.padding(horizontal = 10.dp, vertical = 7.dp),
+            ) {
+                Text(p.name, fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium)
+                Text(p.description, style = MaterialTheme.typography.bodySmall)
+            }
         }
     }
+    Text("BRUSH STUDIO · LIVE SETTINGS", fontWeight = FontWeight.Bold,
+        modifier = Modifier.padding(top = 12.dp))
+    BrushSetting("Hardness", hardness, onHardness)
+    BrushSetting("Spacing", spacing, onSpacing)
+    BrushSetting("Flow", flow, onFlow)
+    BrushSetting("Size pressure", sizePressure, onSizePressure)
+    BrushSetting("Flow pressure", flowPressure, onFlowPressure)
+    BrushSetting("Streamline", streamline, onStreamline)
+}
+
+@Composable
+private fun BrushSetting(label: String, value: Float, onChange: (Float) -> Unit) {
+    ValueSlider(
+        label = label,
+        valueText = "${(value * 100).roundToInt()}%",
+        value = value.coerceIn(0f, 1f),
+        onValueChange = onChange,
+    )
 }
 
 @Composable
