@@ -26,6 +26,10 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -33,11 +37,14 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextField
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -55,6 +62,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.toArgb
@@ -76,6 +86,7 @@ import com.guhit.studio.designsystem.TopBar
 import com.guhit.studio.designsystem.ValueSlider
 import com.guhit.studio.engine.BrushMath
 import com.guhit.studio.engine.BrushPresets
+import com.guhit.studio.engine.BrushShape
 import com.guhit.studio.engine.CanvasSurfaceView
 import com.guhit.studio.engine.CanvasTool
 import com.guhit.studio.engine.ColorHistory
@@ -305,15 +316,23 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
     var barVisible by remember { mutableStateOf(true) }
     var sideVisible by remember { mutableStateOf(true) }
 
+    var customPresets by remember { mutableStateOf(CustomBrushLibrary.load(context)) }
+    val allPresets = remember(customPresets) { BrushPresets.all + customPresets }
     var presetId by remember { mutableStateOf(BrushPresets.all.first().id) }
-    var hardness by remember { mutableFloatStateOf(BrushPresets.all.first().hardness) }
-    var spacing by remember { mutableFloatStateOf(BrushPresets.all.first().spacing) }
-    var flow by remember { mutableFloatStateOf(BrushPresets.all.first().flow) }
-    var sizePressure by remember { mutableFloatStateOf(BrushPresets.all.first().sizePressure) }
-    var flowPressure by remember { mutableFloatStateOf(BrushPresets.all.first().flowPressure) }
-    var streamline by remember { mutableFloatStateOf(BrushPresets.all.first().streamline) }
+    var showSaveBrush by remember { mutableStateOf(false) }
+    var showBrushSettingsFor by remember { mutableStateOf<com.guhit.studio.engine.BrushPreset?>(null) }
+    var newBrushName by remember { mutableStateOf("") }
     var sizeValue by remember { mutableFloatStateOf(0.45f) }
     var opacity by remember { mutableFloatStateOf(1f) }
+    var hardness by remember { mutableFloatStateOf(0.9f) }
+    var flow by remember { mutableFloatStateOf(1f) }
+    var spacing by remember { mutableFloatStateOf(0.06f) }
+    var sizePressure by remember { mutableFloatStateOf(1f) }
+    var flowPressure by remember { mutableFloatStateOf(0f) }
+    var streamline by remember { mutableFloatStateOf(0.3f) }
+    var brushShape by remember { mutableStateOf(BrushShape.ROUND) }
+    var textureAmount by remember { mutableFloatStateOf(0f) }
+    var pressureCurve by remember { mutableFloatStateOf(1f) }
     var color by remember { mutableStateOf(Color.Black) }
     var erase by remember { mutableStateOf(false) }
     var fingerDraws by remember { mutableStateOf(true) }
@@ -348,16 +367,17 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
         main.postDelayed(thumbTask, 350)
     }
 
-    val preset = BrushPresets.byId(presetId).copy(
-        hardness = hardness, spacing = spacing, flow = flow,
-        sizePressure = sizePressure, flowPressure = flowPressure, streamline = streamline
-    )
+    val preset = allPresets.firstOrNull { it.id == presetId } ?: BrushPresets.all.first()
     val sizePx = BrushMath.sizeFromSlider(sizeValue)
 
     // Read EVERY brush-related state here, in the screen's own scope, so any change (size, opacity,
     // color, eraser, preset, finger mode) recomposes this function and re-runs the SideEffect.
     // (Reading them only inside the panels would recompose just the panels and leave the engine stale.)
-    val brushSettings = preset.toSettings(sizePx, opacity, color.toArgb(), erase)
+    val brushSettings = preset.toSettings(sizePx, opacity, color.toArgb(), erase).copy(
+        hardness = hardness, flow = flow, spacing = spacing,
+        sizePressure = sizePressure, flowPressure = flowPressure, streamline = streamline,
+        shape = brushShape, texture = textureAmount, pressureCurve = pressureCurve,
+    )
     val fingerMode = if (fingerDraws) FingerMode.DRAW else FingerMode.NAVIGATE
     val toolNow = tool
     val toleranceNow = tolerance
@@ -480,10 +500,84 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
     val jpegLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("image/jpeg")) {
         runExport(it, ExportFormat.JPEG)
     }
+    val brushExportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        if (uri != null) runCatching {
+            context.contentResolver.openOutputStream(uri)?.use { it.write(CustomBrushLibrary.encode(customPresets).toByteArray(Charsets.UTF_8)) }
+        }.onFailure { Toast.makeText(context, "Brush export failed", Toast.LENGTH_SHORT).show() }
+    }
+    val brushImportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) runCatching {
+            val json = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() } ?: error("Cannot read file")
+            val imported = CustomBrushLibrary.decode(json)
+            val safe = imported.map { it.copy(id = "import_${System.currentTimeMillis()}_${it.id}") }
+            customPresets = customPresets + safe
+            CustomBrushLibrary.save(context, customPresets)
+            Toast.makeText(context, "Imported ${safe.size} brushes", Toast.LENGTH_SHORT).show()
+        }.onFailure { Toast.makeText(context, "Import failed: ${it.message}", Toast.LENGTH_LONG).show() }
+    }
     fun stamp() = "Guhit-" + System.currentTimeMillis()
 
     fun toggle(p: Panel) {
         panel = if (panel == p) Panel.None else p
+    }
+
+    showBrushSettingsFor?.let { previewPreset ->
+        AlertDialog(
+            onDismissRequest = { showBrushSettingsFor = null },
+            title = { Text("${previewPreset.name} · Brush preview & settings") },
+            text = {
+                Column(
+                    Modifier.fillMaxWidth().height(480.dp).verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    BrushStrokePreview(
+                        color = color,
+                        brushSize = sizePx,
+                        opacity = opacity,
+                        hardness = hardness,
+                        flow = flow,
+                        texture = textureAmount,
+                        shape = brushShape,
+                    )
+                    Text(previewPreset.description, style = MaterialTheme.typography.bodySmall)
+                    BrushSettingSlider("Size", sizeValue) { sizeValue = it }
+                    BrushSettingSlider("Opacity", opacity) { opacity = it }
+                    BrushSettingSlider("Hardness", hardness) { hardness = it }
+                    BrushSettingSlider("Flow", flow) { flow = it }
+                    BrushSettingSlider("Spacing", spacing) { spacing = it.coerceAtLeast(0.005f) }
+                    BrushSettingSlider("Size pressure", sizePressure) { sizePressure = it }
+                    BrushSettingSlider("Flow pressure", flowPressure) { flowPressure = it }
+                    BrushSettingSlider("Streamline", streamline) { streamline = it }
+                    BrushSettingSlider("Pigment grain", textureAmount) { textureAmount = it }
+                    BrushSettingSlider("Pressure curve", pressureCurve / 2f) { pressureCurve = it * 2f }
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("Tip shape", style = MaterialTheme.typography.labelMedium)
+                        TextButton(onClick = { brushShape = BrushShape.entries[(brushShape.ordinal + 1) % BrushShape.entries.size] }) { Text(brushShape.name) }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { showBrushSettingsFor = null; panel = Panel.None }) { Text("USE BRUSH") } },
+            dismissButton = { TextButton(onClick = { showBrushSettingsFor = null }) { Text("CLOSE") } },
+        )
+    }
+
+    if (showSaveBrush) {
+        AlertDialog(
+            onDismissRequest = { showSaveBrush = false },
+            title = { Text("Save custom brush") },
+            text = { TextField(value = newBrushName, onValueChange = { newBrushName = it.take(48) }, label = { Text("Brush name") }, singleLine = true) },
+            confirmButton = { TextButton(onClick = {
+                val name = newBrushName.trim()
+                if (name.isNotEmpty()) {
+                    val custom = preset.copy(id = "custom_${System.currentTimeMillis()}", name = name, description = "User-created brush profile", hardness = hardness, flow = flow, spacing = spacing, sizePressure = sizePressure, flowPressure = flowPressure, streamline = streamline, shape = brushShape, texture = textureAmount, pressureCurve = pressureCurve)
+                    customPresets = customPresets + custom
+                    CustomBrushLibrary.save(context, customPresets)
+                    presetId = custom.id
+                }
+                showSaveBrush = false
+            }) { Text("Save") } },
+            dismissButton = { TextButton(onClick = { showSaveBrush = false }) { Text("Cancel") } },
+        )
     }
 
     BackHandler(enabled = !closing) {
@@ -558,22 +652,48 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
             ) {
                 BottomSheetPanel(scroll = panel != Panel.Layers) {
                     when (panel) {
-                        Panel.Brushes -> BrushList(
-                            selectedId = presetId,
-                            hardness = hardness, spacing = spacing, flow = flow,
-                            sizePressure = sizePressure, flowPressure = flowPressure,
-                            streamline = streamline,
-                            onSelect = { id ->
-                                val p = BrushPresets.byId(id)
-                                presetId = id
-                                hardness = p.hardness; spacing = p.spacing; flow = p.flow
-                                sizePressure = p.sizePressure; flowPressure = p.flowPressure
-                                streamline = p.streamline
-                            },
-                            onHardness = { hardness = it }, onSpacing = { spacing = it },
-                            onFlow = { flow = it }, onSizePressure = { sizePressure = it },
-                            onFlowPressure = { flowPressure = it }, onStreamline = { streamline = it },
-                        )
+                        Panel.Brushes -> Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text("BRUSH LIBRARY · ${allPresets.size} PRESETS", style = MaterialTheme.typography.labelMedium)
+                            BrushList(
+                                presets = allPresets,
+                                selectedId = presetId,
+                                onSelect = { id ->
+                                    presetId = id
+                                    val selected = allPresets.first { item -> item.id == id }
+                                    hardness = selected.hardness; flow = selected.flow; spacing = selected.spacing
+                                    sizePressure = selected.sizePressure; flowPressure = selected.flowPressure
+                                    streamline = selected.streamline; brushShape = selected.shape
+                                    textureAmount = selected.texture; pressureCurve = selected.pressureCurve
+                                },
+                                onPreview = { selected ->
+                                    presetId = selected.id
+                                    hardness = selected.hardness; flow = selected.flow; spacing = selected.spacing
+                                    sizePressure = selected.sizePressure; flowPressure = selected.flowPressure
+                                    streamline = selected.streamline; brushShape = selected.shape
+                                    textureAmount = selected.texture; pressureCurve = selected.pressureCurve
+                                    showBrushSettingsFor = selected
+                                },
+                            )
+                            TextButton(onClick = { newBrushName = ""; showSaveBrush = true }) { Text("＋ SAVE CURRENT SETTINGS AS CUSTOM BRUSH") }
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                TextButton(onClick = { brushExportLauncher.launch("Guhit-brushes.json") }) { Text("EXPORT") }
+                                TextButton(onClick = { brushImportLauncher.launch(arrayOf("application/json", "text/json", "*/*")) }) { Text("IMPORT") }
+                            }
+                            Text("CUSTOM BRUSHES ARE SAVED ON THIS DEVICE", style = MaterialTheme.typography.labelSmall)
+                            Text("BRUSH ENGINE SETTINGS", style = MaterialTheme.typography.labelMedium)
+                            BrushSettingSlider("Hardness", hardness) { hardness = it }
+                            BrushSettingSlider("Flow", flow) { flow = it }
+                            BrushSettingSlider("Spacing", spacing.coerceIn(0f, 1f)) { spacing = it.coerceAtLeast(0.005f) }
+                            BrushSettingSlider("Size pressure", sizePressure) { sizePressure = it }
+                            BrushSettingSlider("Flow pressure", flowPressure) { flowPressure = it }
+                            BrushSettingSlider("Streamline", streamline) { streamline = it }
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Text("Tip shape", style = MaterialTheme.typography.labelMedium)
+                                TextButton(onClick = { brushShape = BrushShape.entries[(brushShape.ordinal + 1) % BrushShape.entries.size] }) { Text(brushShape.name) }
+                            }
+                            BrushSettingSlider("Pigment grain", textureAmount) { textureAmount = it }
+                            BrushSettingSlider("Pressure curve", pressureCurve / 2f) { pressureCurve = it * 2f }
+                        }
                         Panel.Color -> ColorPickerPanel(
                             color = color,
                             onColorChange = { color = it },
@@ -753,49 +873,75 @@ private fun EditorContent(artwork: Artwork, onClose: () -> Unit) {
 }
 
 @Composable
+private fun BrushSettingSlider(label: String, value: Float, onChange: (Float) -> Unit) {
+    Column(Modifier.fillMaxWidth().padding(horizontal = 8.dp)) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(label, style = MaterialTheme.typography.labelMedium)
+            Text("${(value * 100).roundToInt()}%", style = MaterialTheme.typography.labelSmall)
+        }
+        Slider(value = value.coerceIn(0f, 1f), onValueChange = onChange)
+    }
+}
+
 private fun BrushList(
+    presets: List<com.guhit.studio.engine.BrushPreset>,
     selectedId: String,
-    hardness: Float, spacing: Float, flow: Float,
-    sizePressure: Float, flowPressure: Float, streamline: Float,
     onSelect: (String) -> Unit,
-    onHardness: (Float) -> Unit, onSpacing: (Float) -> Unit,
-    onFlow: (Float) -> Unit, onSizePressure: (Float) -> Unit,
-    onFlowPressure: (Float) -> Unit, onStreamline: (Float) -> Unit,
+    onPreview: (com.guhit.studio.engine.BrushPreset) -> Unit,
 ) {
-    Text("BRUSH LIBRARY · ${BrushPresets.all.size} PRESETS", fontWeight = FontWeight.Bold)
-    BrushPresets.all.groupBy { it.category }.forEach { (category, presets) ->
-        Text(category.uppercase(Locale.getDefault()), color = MaterialTheme.colorScheme.primary,
-            style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(top = 8.dp))
-        presets.forEach { p ->
-            val selected = p.id == selectedId
-            Column(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
-                    .background(if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f) else Color.Transparent)
-                    .clickable { onSelect(p.id) }.padding(horizontal = 10.dp, vertical = 7.dp),
-            ) {
+    presets.forEach { p ->
+        val selected = p.id == selectedId
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(10.dp))
+                .background(if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f) else Color.Transparent)
+                .padding(start = 10.dp, end = 4.dp, top = 5.dp, bottom = 5.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f).clickable { onSelect(p.id) }.padding(vertical = 5.dp)) {
                 Text(p.name, fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium)
                 Text(p.description, style = MaterialTheme.typography.bodySmall)
             }
+            TextButton(onClick = { onPreview(p) }) { Text("PREVIEW  ⚙") }
         }
     }
-    Text("BRUSH STUDIO · LIVE SETTINGS", fontWeight = FontWeight.Bold,
-        modifier = Modifier.padding(top = 12.dp))
-    BrushSetting("Hardness", hardness, onHardness)
-    BrushSetting("Spacing", spacing, onSpacing)
-    BrushSetting("Flow", flow, onFlow)
-    BrushSetting("Size pressure", sizePressure, onSizePressure)
-    BrushSetting("Flow pressure", flowPressure, onFlowPressure)
-    BrushSetting("Streamline", streamline, onStreamline)
 }
 
 @Composable
-private fun BrushSetting(label: String, value: Float, onChange: (Float) -> Unit) {
-    ValueSlider(
-        label = label,
-        valueText = "${(value * 100).roundToInt()}%",
-        value = value.coerceIn(0f, 1f),
-        onValueChange = onChange,
-    )
+private fun BrushStrokePreview(
+    color: Color,
+    brushSize: Float,
+    opacity: Float,
+    hardness: Float,
+    flow: Float,
+    texture: Float,
+    shape: BrushShape,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth().height(112.dp),
+        color = Color(0xFF202A38),
+        shape = RoundedCornerShape(12.dp),
+    ) {
+        Canvas(Modifier.fillMaxSize().padding(8.dp)) {
+            val path = Path().apply {
+                moveTo(size.width * 0.06f, size.height * 0.72f)
+                cubicTo(size.width * 0.28f, size.height * 0.05f, size.width * 0.58f, size.height * 0.98f, size.width * 0.94f, size.height * 0.28f)
+            }
+            val widthPx = (brushSize.coerceIn(1f, 300f) / 300f * this.size.height * 0.72f).coerceIn(2f, this.size.height * 0.78f)
+            val alpha = (opacity * flow).coerceIn(0.03f, 1f)
+            val cap = if (shape == BrushShape.SQUARE) StrokeCap.Butt else StrokeCap.Round
+            drawPath(path, color.copy(alpha = alpha), style = Stroke(widthPx, cap = cap))
+            if (texture > 0.08f) {
+                val count = (texture * 42).toInt().coerceIn(1, 42)
+                for (i in 0 until count) {
+                    val x = size.width * (0.12f + (i % 14) / 16f)
+                    val y = size.height * (0.2f + ((i * 7) % 13) / 18f)
+                    drawCircle(Color.White.copy(alpha = texture * 0.22f * (1f - hardness * 0.35f)), radius = 0.8f + texture * 1.4f, center = androidx.compose.ui.geometry.Offset(x, y))
+                }
+            }
+        }
+    }
 }
 
 @Composable
