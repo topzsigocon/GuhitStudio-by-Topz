@@ -40,16 +40,3 @@ then `base64 -w0 release.jks` for the secret. Never commit the keystore.
 
 ## License
 Personal use only. See LICENSE.
-
-## GuhitStudio Brush Library
-
-The editor includes an original, built-in brush collection inspired by common workflows in professional digital painting apps. It contains 31 presets across Ink, Pencil, Marker, Paint, Wet Media, Texture, Effects, Pixel, Blender, and Eraser categories. Presets marked **PRO** are advanced GuhitStudio originals; they are not copied proprietary Procreate, ibis Paint X, or Autodesk SketchBook assets.
-
-Open the Brushes panel to browse categorized presets and see a stroke preview for each. Select a brush to expose adjustable Hardness, Flow, Spacing, Size Pressure, and Streamline sliders. Brush settings are applied directly to the native stroke engine.
-
-
-## GuhitStudio Brush Library
-
-The editor includes an original, built-in brush collection inspired by common workflows in professional digital painting apps. It contains 31 presets across Ink, Pencil, Marker, Paint, Wet Media, Texture, Effects, Pixel, Blender, and Eraser categories. Presets marked **PRO** are advanced GuhitStudio originals; they are not copied proprietary Procreate, ibis Paint X, or Autodesk SketchBook assets.
-
-Open the Brushes panel to browse categorized presets and see a stroke preview for each. Select a brush to expose adjustable Hardness, Flow, Spacing, Size Pressure, and Streamline sliders. Brush settings are applied directly to the native stroke engine.
